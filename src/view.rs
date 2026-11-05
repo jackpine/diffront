@@ -1408,26 +1408,37 @@ impl DiffView {
                     .child(self.render_chevron(collapsed, theme))
                     .child(
                         div()
+                            .min_w(px(0.))
+                            .truncate()
                             .font_family(MONO_FONT)
                             .text_sm()
                             .child(file.path.clone()),
                     )
-                    .children(
-                        change
-                            .into_iter()
-                            .map(|change| div().text_xs().text_color(theme.muted).child(change)),
-                    )
-                    .children(
-                        notice
-                            .into_iter()
-                            .map(|notice| div().text_xs().text_color(theme.muted).child(notice)),
-                    )
+                    .children(change.into_iter().map(|change| {
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child(change)
+                    }))
+                    .children(notice.into_iter().map(|notice| {
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child(notice)
+                    }))
                     .child(div().flex_1())
-                    .child(Self::render_stats(file.added, file.removed, theme)),
+                    .child(div().flex_shrink_0().child(Self::render_stats(
+                        file.added,
+                        file.removed,
+                        theme,
+                    ))),
             )
             .child(
                 div()
                     .id(("reviewed", file_ix))
+                    .flex_shrink_0()
                     .debug_selector(|| format!("reviewed-{file_ix}"))
                     .flex()
                     .items_center()
