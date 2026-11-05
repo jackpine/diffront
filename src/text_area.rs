@@ -96,7 +96,6 @@ impl TextArea {
             KeyBinding::new("shift-backspace", Backspace, context),
             KeyBinding::new("delete", Delete, context),
             KeyBinding::new(&format!("{word}-backspace"), DeleteWordLeft, context),
-            KeyBinding::new("enter", Newline, context),
             KeyBinding::new("shift-enter", Newline, context),
             KeyBinding::new("left", Left, context),
             KeyBinding::new("right", Right, context),
@@ -176,7 +175,7 @@ impl TextArea {
         } else if row_center > layout.height() {
             self.content.len()
         } else {
-            layout.index_for_position(point(position.x, row_center))
+            self.valid_offset(layout.index_for_position(point(position.x, row_center)))
         }
     }
 
@@ -270,9 +269,16 @@ impl TextArea {
     }
 
     fn index_for_mouse(&self, position: Point<Pixels>) -> usize {
-        self.layout.as_ref().map_or(0, |layout| {
-            layout.index_for_position(position - layout.bounds.origin)
-        })
+        let Some(layout) = &self.layout else {
+            return 0;
+        };
+        self.valid_offset(layout.index_for_position(position - layout.bounds.origin))
+    }
+
+    /// Layouts can describe the placeholder or a previous frame's text, so their offsets may not
+    /// fit the current content.
+    fn valid_offset(&self, offset: usize) -> usize {
+        self.content.floor_char_boundary(offset)
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -296,10 +302,14 @@ impl TextArea {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
+        Self::utf8_offset(&self.content, offset)
+    }
+
+    fn utf8_offset(text: &str, utf16_offset: usize) -> usize {
         let mut utf8_offset = 0;
         let mut utf16_count = 0;
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
+        for ch in text.chars() {
+            if utf16_count >= utf16_offset {
                 break;
             }
             utf16_count += ch.len_utf16();
@@ -388,8 +398,9 @@ impl EntityInputHandler for TextArea {
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         if let Some(selected) = new_selected_range_utf16 {
-            let selected = self.range_from_utf16(&selected);
-            self.selected_range = range.start + selected.start..range.start + selected.end;
+            let start = range.start + Self::utf8_offset(new_text, selected.start);
+            let end = range.start + Self::utf8_offset(new_text, selected.end);
+            self.selected_range = start..end;
         }
     }
 
@@ -415,8 +426,8 @@ impl EntityInputHandler for TextArea {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let layout = self.layout.as_ref()?;
-        let index = layout.index_for_position(point - layout.bounds.origin);
+        self.layout.as_ref()?;
+        let index = self.index_for_mouse(point);
         Some(self.offset_to_utf16(index))
     }
 }

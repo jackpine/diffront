@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 #[derive(Debug, PartialEq)]
 pub enum Change {
     Modified,
@@ -31,6 +33,16 @@ pub enum LineKind {
     Removed { old: u32 },
 }
 
+impl LineKind {
+    pub fn marker(self) -> char {
+        match self {
+            LineKind::Context { .. } => ' ',
+            LineKind::Added { .. } => '+',
+            LineKind::Removed { .. } => '-',
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct DiffLine {
     pub kind: LineKind,
@@ -54,7 +66,7 @@ impl Row {
 }
 
 /// Parsed `git diff` output.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Diff {
     pub files: Vec<FileHeader>,
     pub rows: Vec<Row>,
@@ -121,6 +133,15 @@ impl HunkCursor {
 }
 
 impl Diff {
+    /// The rows of a file below its header.
+    pub fn file_body(&self, file: usize) -> Range<usize> {
+        let end = self
+            .files
+            .get(file + 1)
+            .map_or(self.rows.len(), |next| next.first_row);
+        self.files[file].first_row + 1..end
+    }
+
     pub fn parse(patch: &str) -> Self {
         let mut diff = Self::default();
         let mut hunk: Option<HunkCursor> = None;

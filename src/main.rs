@@ -1,6 +1,8 @@
 mod diff;
+mod display;
 mod git;
 mod review;
+mod symbols;
 mod text_area;
 mod theme;
 mod view;
@@ -31,7 +33,7 @@ fn main() {
         println!("{USAGE}");
         return;
     }
-    let (repo_name, review) = match load_review(&args) {
+    let (repo, review) = match load_review(&args) {
         Ok(loaded) => loaded,
         Err(err) => {
             eprintln!("diffront: {err}");
@@ -44,6 +46,8 @@ fn main() {
     }
 
     Application::new().run(move |cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        set_dock_icon();
         TextArea::bind_keys(cx);
         DiffView::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
@@ -63,25 +67,39 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(format!("{repo_name} — diffront").into()),
+                    title: Some(format!("{} — diffront", repo.name()).into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| DiffView::new(review, window, cx)),
+            |window, cx| cx.new(|cx| DiffView::new(review, repo, args, window, cx)),
         )
         .expect("failed to open window");
         cx.activate(true);
     });
 }
 
-fn load_review(args: &[String]) -> Result<(String, Review), String> {
+fn load_review(args: &[String]) -> Result<(Repo, Review), String> {
     let repo = Repo::discover()?;
-    let source = if args.is_empty() {
-        "git diff HEAD + untracked files".to_string()
-    } else {
-        format!("git diff {}", args.join(" "))
-    };
     let diff = Diff::parse(&repo.patch(args)?);
-    Ok((repo.name(), Review::new(source, diff)))
+    Ok((repo, Review::new(Repo::describe(args), diff)))
+}
+
+/// Sets the Dock icon, which an unbundled binary doesn't otherwise have.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::AnyThread;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../assets/icon.png"));
+    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        unsafe {
+            NSApplication::sharedApplication(main_thread).setApplicationIconImage(Some(&image));
+        }
+    }
 }
