@@ -114,6 +114,7 @@ impl Repo {
                 "log",
                 "--no-color",
                 "--max-count=200",
+                "--reverse",
                 "--format=%H%x00%h%x00%s%x00%an%x00%ar",
                 range,
             ]),
@@ -425,12 +426,12 @@ mod tests {
         repo.git(&["checkout", "-q", "-b", "feature"]);
         repo.commit("second");
         repo.commit("third");
-        assert_eq!(repo.subjects(&[]), vec!["third", "second"]);
+        assert_eq!(repo.subjects(&[]), vec!["second", "third"]);
         assert_eq!(
             repo.subjects(&["--merge-base", "main"]),
-            vec!["third", "second"]
+            vec!["second", "third"]
         );
-        assert_eq!(repo.subjects(&["main...HEAD"]), vec!["third", "second"]);
+        assert_eq!(repo.subjects(&["main...HEAD"]), vec!["second", "third"]);
         assert_eq!(repo.subjects(&["HEAD~1"]), vec!["third"]);
         assert_eq!(repo.subjects(&["HEAD~2", "HEAD~1"]), vec!["second"]);
         assert_eq!(repo.subjects(&["HEAD~1", "--", "src"]), vec!["third"]);
@@ -440,7 +441,7 @@ mod tests {
     fn default_branch_with_nothing_ahead_shows_recent_history() {
         let repo = TestRepo::new("recent");
         repo.commit("second");
-        assert_eq!(repo.subjects(&[]), vec!["second", "first"]);
+        assert_eq!(repo.subjects(&[]), vec!["first", "second"]);
     }
 
     #[test]
@@ -450,7 +451,7 @@ mod tests {
         repo.git(&["add", "-A"]);
         repo.commit("add file");
         let root = Repo::at(&repo.0);
-        let sha = root.commits(&[]).unwrap()[0].sha.clone();
+        let sha = root.commits(&[]).unwrap().pop().unwrap().sha;
         assert!(root.commit_patch(&sha).unwrap().contains("+one"));
     }
 }

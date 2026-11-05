@@ -7,8 +7,8 @@ use crate::text_area::TextArea;
 use crate::theme::{MONO_FONT, Theme};
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla, KeyBinding,
-    ListAlignment, ListOffset, ListState, SharedString, Stateful, Task, Window, actions, div, img,
-    list, prelude::*, px, relative,
+    ListAlignment, ListOffset, ListState, ScrollHandle, SharedString, Stateful, Task, Window,
+    actions, div, img, list, prelude::*, px, relative,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -81,6 +81,7 @@ pub struct DiffView {
     parked: BTreeMap<ViewKey, Parked>,
     tab: Tab,
     commits: Vec<Commit>,
+    commit_scroll: ScrollHandle,
     selected_commit: Option<String>,
     commits_load: Option<Task<()>>,
     commit_load: Option<Task<()>>,
@@ -126,6 +127,7 @@ impl DiffView {
             parked: BTreeMap::new(),
             tab: Tab::Files,
             commits: Vec::new(),
+            commit_scroll: ScrollHandle::new(),
             selected_commit: None,
             commits_load: None,
             commit_load: None,
@@ -349,13 +351,13 @@ impl DiffView {
         cx.notify();
     }
 
-    /// Shows the selected commit, or the first one if it's no longer listed.
+    /// Shows the selected commit, or the newest one if it's no longer listed.
     fn select_listed_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self
             .selected_commit
             .as_ref()
             .filter(|sha| self.commits.iter().any(|commit| commit.sha == **sha))
-            .or(self.commits.first().map(|commit| &commit.sha))
+            .or(self.commits.last().map(|commit| &commit.sha))
             .cloned();
         match selected {
             Some(sha) => self.show_commit(sha, window, cx),
@@ -363,9 +365,19 @@ impl DiffView {
         }
     }
 
+    fn select_commit(&mut self, sha: String) {
+        match self.commits.iter().position(|commit| commit.sha == sha) {
+            // Unlike scrolling to an item, this also works before the list's first layout.
+            Some(ix) if ix + 1 == self.commits.len() => self.commit_scroll.scroll_to_bottom(),
+            Some(ix) => self.commit_scroll.scroll_to_item(ix),
+            None => {}
+        }
+        self.selected_commit = Some(sha);
+    }
+
     fn show_commit(&mut self, sha: String, window: &mut Window, cx: &mut Context<Self>) {
         self.save_open_draft(window, cx);
-        self.selected_commit = Some(sha.clone());
+        self.select_commit(sha.clone());
         let key = ViewKey::Commit(sha.clone());
         if self.review_for(&key).is_some() {
             self.commit_load = None;
@@ -457,23 +469,25 @@ impl DiffView {
     /// Replaces the commit list, keeping commits with comments even if they left the range.
     fn finish_commits(
         &mut self,
-        mut commits: Vec<Commit>,
+        commits: Vec<Commit>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mut kept = Vec::new();
         for commit in std::mem::take(&mut self.commits) {
             let listed = commits.iter().any(|new| new.sha == commit.sha);
             let has_comments = self
                 .review_for(&ViewKey::Commit(commit.sha.clone()))
                 .is_some_and(|review| !review.comments.is_empty());
             if !listed && has_comments {
-                commits.push(Commit {
+                kept.push(Commit {
                     in_range: false,
                     ..commit
                 });
             }
         }
-        self.commits = commits;
+        kept.extend(commits);
+        self.commits = kept;
         if self.tab == Tab::Commits {
             self.select_listed_commit(window, cx);
         }
@@ -493,7 +507,7 @@ impl DiffView {
             ViewKey::Files => self.tab = Tab::Files,
             ViewKey::Commit(sha) => {
                 self.tab = Tab::Commits;
-                self.selected_commit = Some(sha.clone());
+                self.select_commit(sha.clone());
             }
         }
         self.activate(key, cx);
@@ -1073,6 +1087,7 @@ impl DiffView {
             .collect();
         div()
             .id("commits")
+            .track_scroll(&self.commit_scroll)
             .flex()
             .flex_col()
             .flex_shrink_0()
@@ -2932,11 +2947,11 @@ mod tests {
         assert!(source(&view, cx).ends_with("(beta)"));
         row_with_text(&view, "beta", cx);
 
-        click_selector("next-commit", cx);
+        click_selector("previous-commit", cx);
         assert!(source(&view, cx).ends_with("(alpha)"));
         row_with_text(&view, "alpha", cx);
 
-        cx.simulate_keystrokes("cmd-[");
+        cx.simulate_keystrokes("cmd-]");
         cx.run_until_parked();
         assert!(source(&view, cx).ends_with("(beta)"));
 
@@ -2954,9 +2969,9 @@ mod tests {
         comment_on(&view, "beta", "on a commit", cx);
         let commit_row = row_with_text(&view, "beta", cx);
 
-        click_selector("next-commit", cx);
-        assert_eq!(view.read_with(cx, |view, _| view.review.comments.len()), 0);
         click_selector("previous-commit", cx);
+        assert_eq!(view.read_with(cx, |view, _| view.review.comments.len()), 0);
+        click_selector("next-commit", cx);
         assert_eq!(
             comment(&view, commit_row, cx).as_deref(),
             Some("on a commit")
@@ -2980,7 +2995,7 @@ mod tests {
         comment_on(&view, "beta", "on a commit", cx);
         let (row, short) = view.read_with(cx, |view, _| {
             let row = *view.review.comments.keys().next().unwrap();
-            (row, view.commits[0].short.clone())
+            (row, view.commits[1].short.clone())
         });
         click_selector("tab-files", cx);
         click_selector("finish-review", cx);
@@ -3002,7 +3017,7 @@ mod tests {
         cx.run_until_parked();
 
         let commits = view.read_with(cx, |view, _| view.commits.clone());
-        assert_eq!(commits[0].subject, "beta reworded");
+        assert_eq!(commits.last().unwrap().subject, "beta reworded");
         let kept = commits
             .iter()
             .find(|commit| commit.subject == "beta")
@@ -3038,8 +3053,8 @@ mod tests {
         let row = row_with_text(&view, "beta", cx);
         click_row(&view, row, cx);
         cx.simulate_input("half typed");
-        click_selector("next-commit", cx);
         click_selector("previous-commit", cx);
+        click_selector("next-commit", cx);
         assert_eq!(comment(&view, row, cx).as_deref(), Some("half typed"));
     }
 
@@ -3117,5 +3132,28 @@ mod tests {
         cx.run_until_parked();
         let top = view.read_with(cx, |view, _| view.list.logical_scroll_top().item_ix);
         assert!(top > 100);
+    }
+
+    #[gpui::test]
+    fn commit_list_starts_scrolled_to_the_newest_at_the_bottom(cx: &mut TestAppContext) {
+        let repo = TestRepo::new("commit-order", "one\n");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        for ix in 0..40 {
+            repo.write(&format!("{ix}\n"));
+            repo.git(&["commit", "-qam", &format!("change {ix}")]);
+        }
+        let (view, cx) = repo.open(cx);
+        click_selector("tab-commits", cx);
+        cx.run_until_parked();
+        let subjects = view.read_with(cx, |view, _| {
+            let subject = |commit: Option<&Commit>| commit.unwrap().subject.clone();
+            (subject(view.commits.first()), subject(view.commits.last()))
+        });
+        assert_eq!(subjects, ("change 0".to_string(), "change 39".to_string()));
+        assert!(source(&view, cx).ends_with("(change 39)"));
+
+        let newest = cx.debug_bounds("commit-change 39").expect("row is painted");
+        let height = view.update_in(cx, |_, window, _| window.viewport_size().height);
+        assert!(newest.bottom() <= height);
     }
 }
