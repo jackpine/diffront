@@ -29,6 +29,8 @@ Drag across text in a column to select it, and `⌘C` to copy. `⌘F` searches w
 including file paths and hunk headers but not the bodies of collapsed files. `Enter` and `Shift+Enter`
 (or `⌘G` and `⌘⇧G`) move between matches, and `Esc` closes the search.
 
+`j` and `k` scroll the diff.
+
 The Files changed and Commits tabs (`⌘1`, `⌘2`) switch between the whole diff and one commit at a
 time; `⌘[` and `⌘]` step through commits. Comments stay with the view you left them in, and all of
 them are copied together.

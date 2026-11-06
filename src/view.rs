@@ -31,6 +31,8 @@ actions!(
         NextCommit,
         PreviousCommit,
         ToggleCurrentFileReviewed,
+        ScrollDown,
+        ScrollUp,
         ShowSearch,
         NextMatch,
         PreviousMatch
@@ -45,6 +47,7 @@ const SIDE_COMMENT_INDENT: f32 = 74.;
 const FILE_GAP: f32 = 16.;
 /// Rows kept above a revealed line, enough to clear the sticky file header.
 const REVEAL_CONTEXT_ITEMS: usize = 3;
+const KEY_SCROLL_DISTANCE: f32 = 60.;
 /// Clears the sticky file header, which would otherwise cover a match at the top of the list.
 const MATCH_TOP_MARGIN: f32 = 40.;
 
@@ -183,6 +186,8 @@ impl DiffView {
             KeyBinding::new("secondary-shift-c", CopyComments, None),
             KeyBinding::new("secondary-c", CopySelection, Some("DiffView")),
             KeyBinding::new("secondary-shift-r", ToggleCurrentFileReviewed, None),
+            KeyBinding::new("j", ScrollDown, Some("DiffView && !TextArea")),
+            KeyBinding::new("k", ScrollUp, Some("DiffView && !TextArea")),
             KeyBinding::new("secondary-f", ShowSearch, None),
             KeyBinding::new("secondary-g", NextMatch, None),
             KeyBinding::new("secondary-shift-g", PreviousMatch, None),
@@ -790,6 +795,11 @@ impl DiffView {
     fn top_row(&self) -> Option<usize> {
         self.display
             .first_row_at(self.list.logical_scroll_top().item_ix)
+    }
+
+    fn scroll_by_key(&mut self, distance: f32, cx: &mut Context<Self>) {
+        self.list.scroll_by(px(distance));
+        cx.notify();
     }
 
     /// The file at the top of the list, whose header is pinned once scrolled past.
@@ -2449,6 +2459,14 @@ impl Render for DiffView {
             .on_action(cx.listener(Self::copy_comments))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::toggle_current_file_reviewed))
+            .on_action(cx.listener(|this, _: &ScrollDown, _, cx| {
+                this.scroll_by_key(KEY_SCROLL_DISTANCE, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ScrollUp, _, cx| {
+                    this.scroll_by_key(-KEY_SCROLL_DISTANCE, cx)
+                }),
+            )
             .on_action(cx.listener(Self::show_search))
             .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_match(-1, cx)))
@@ -3130,6 +3148,63 @@ mod tests {
         toggle_reviewed(&view, 0, cx);
         let top = view.read_with(cx, |view, _| view.list.logical_scroll_top().item_ix);
         assert_eq!(top, 0);
+    }
+
+    fn scroll_position(view: &Entity<DiffView>, cx: &mut VisualTestContext) -> (usize, Pixels) {
+        view.read_with(cx, |view, _| {
+            let top = view.list.logical_scroll_top();
+            (top.item_ix, top.offset_in_item)
+        })
+    }
+
+    #[gpui::test]
+    fn j_and_k_scroll_and_stop_at_both_ends(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        let start = scroll_position(&view, cx);
+        cx.simulate_keystrokes("k");
+        cx.run_until_parked();
+        assert_eq!(scroll_position(&view, cx), start);
+
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        let down = scroll_position(&view, cx);
+        assert!(down > start);
+        cx.simulate_keystrokes("k");
+        cx.run_until_parked();
+        assert_eq!(scroll_position(&view, cx), start);
+
+        let last = view.read_with(cx, |view, _| view.display.len() - 1);
+        scroll_list_to(&view, last, cx);
+        let bottom = scroll_position(&view, cx);
+        cx.simulate_keystrokes("j j j");
+        cx.run_until_parked();
+        assert_eq!(scroll_position(&view, cx), bottom);
+        cx.simulate_keystrokes("k");
+        cx.run_until_parked();
+        assert!(scroll_position(&view, cx) < bottom);
+    }
+
+    #[gpui::test]
+    fn j_and_k_type_into_text_boxes(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        let start = scroll_position(&view, cx);
+        search_for("x", cx);
+        let searching = scroll_position(&view, cx);
+        cx.simulate_keystrokes("j k");
+        cx.run_until_parked();
+        assert_eq!(scroll_position(&view, cx), searching);
+        let query = view.read_with(cx, |view, _| view.search.query().to_string());
+        assert_eq!(query, "xjk");
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(scroll_position(&view, cx), start);
+        click_row(&view, 2, cx);
+        let drafting = scroll_position(&view, cx);
+        cx.simulate_keystrokes("j k");
+        cx.run_until_parked();
+        assert_eq!(scroll_position(&view, cx), drafting);
+        assert_eq!(draft_text(&view, cx), "jk");
     }
 
     fn reviewed_files(view: &Entity<DiffView>, cx: &mut VisualTestContext) -> Vec<usize> {
