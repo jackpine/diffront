@@ -1241,7 +1241,7 @@ impl DiffView {
                     .review_for(&ViewKey::Commit(sha.clone()))
                     .map_or(0, |review| review.comments.len());
                 let selected = self.selected_commit.as_ref() == Some(&sha);
-                let detail = if commit.in_range {
+                let identity = if commit.in_range {
                     commit.short.clone()
                 } else {
                     format!("{} · not in range", commit.short)
@@ -1268,11 +1268,24 @@ impl DiffView {
                             .child(div().truncate().text_sm().child(commit.subject.clone()))
                             .child(
                                 div()
-                                    .truncate()
-                                    .font_family(MONO_FONT)
+                                    .flex()
+                                    .gap_2()
                                     .text_xs()
                                     .text_color(theme.muted)
-                                    .child(detail),
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .font_family(MONO_FONT)
+                                            .child(identity),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .child(commit.author.clone()),
+                                    )
+                                    .child(div().flex_shrink_0().child(commit.when.clone())),
                             ),
                     )
                     .when(comments > 0, |item| {
