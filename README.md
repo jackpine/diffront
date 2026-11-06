@@ -21,7 +21,8 @@ git config --global alias.review '!f() { cd "${GIT_PREFIX:-.}" && diffront "$@";
 
 Click a line to comment on it. Press `Enter` to save, `Shift+Enter` for a new line, or `Esc` to
 cancel. `⌘⇧C` copies the review as Markdown, and Finish review adds an overall comment. Tick
-Reviewed on a file to mark and collapse it, or click its header to just collapse it. The diff is
+Reviewed on a file to mark and collapse it, or press `⌘⇧R` to do that for the file at the top of
+the list. Click a file's header to just collapse it. The diff is
 side by side; `⌘⇧D` or the toolbar button switches to inline. On Linux, use `Ctrl` in place of `⌘`.
 
 Drag across text in a column to select it, and `⌘C` to copy. `⌘F` searches what's on screen,

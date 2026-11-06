@@ -30,6 +30,7 @@ actions!(
         ShowCommits,
         NextCommit,
         PreviousCommit,
+        ToggleCurrentFileReviewed,
         ShowSearch,
         NextMatch,
         PreviousMatch
@@ -181,6 +182,7 @@ impl DiffView {
         cx.bind_keys([
             KeyBinding::new("secondary-shift-c", CopyComments, None),
             KeyBinding::new("secondary-c", CopySelection, Some("DiffView")),
+            KeyBinding::new("secondary-shift-r", ToggleCurrentFileReviewed, None),
             KeyBinding::new("secondary-f", ShowSearch, None),
             KeyBinding::new("secondary-g", NextMatch, None),
             KeyBinding::new("secondary-shift-g", PreviousMatch, None),
@@ -790,6 +792,22 @@ impl DiffView {
             .first_row_at(self.list.logical_scroll_top().item_ix)
     }
 
+    /// The file at the top of the list, whose header is pinned once scrolled past.
+    fn current_file(&self) -> Option<usize> {
+        self.top_row().map(|row| self.review.diff.rows[row].file())
+    }
+
+    fn toggle_current_file_reviewed(
+        &mut self,
+        _: &ToggleCurrentFileReviewed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(file) = self.current_file().filter(|_| self.showing_diff()) {
+            self.toggle_reviewed(file, window, cx);
+        }
+    }
+
     fn toggle_reviewed(&mut self, file: usize, window: &mut Window, cx: &mut Context<Self>) {
         let reviewed = self.review.reviewed.insert(file);
         if !reviewed {
@@ -1378,7 +1396,7 @@ impl DiffView {
     }
 
     fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.top_row().map(|row| self.review.diff.rows[row].file());
+        let active = self.current_file();
         let items = self.review.diff.files.iter().enumerate().map(|(ix, file)| {
             let (dir, name) = file
                 .path
@@ -2430,6 +2448,7 @@ impl Render for DiffView {
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.dismiss_selection(cx)))
             .on_action(cx.listener(Self::copy_comments))
             .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::toggle_current_file_reviewed))
             .on_action(cx.listener(Self::show_search))
             .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_match(-1, cx)))
@@ -3111,6 +3130,42 @@ mod tests {
         toggle_reviewed(&view, 0, cx);
         let top = view.read_with(cx, |view, _| view.list.logical_scroll_top().item_ix);
         assert_eq!(top, 0);
+    }
+
+    fn reviewed_files(view: &Entity<DiffView>, cx: &mut VisualTestContext) -> Vec<usize> {
+        view.read_with(cx, |view, _| view.review.reviewed.iter().copied().collect())
+    }
+
+    #[gpui::test]
+    fn review_shortcut_targets_the_pinned_file_or_the_header_at_the_top(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        cx.simulate_keystrokes("cmd-shift-r");
+        cx.run_until_parked();
+        assert_eq!(reviewed_files(&view, cx), [0]);
+        cx.simulate_keystrokes("cmd-shift-r");
+        cx.run_until_parked();
+        assert_eq!(reviewed_files(&view, cx), Vec::<usize>::new());
+
+        let second_file = view.read_with(cx, |view, _| {
+            view.display.item_of(view.review.diff.files[1].first_row)
+        });
+        scroll_list_to(&view, second_file + 1, cx);
+        assert_eq!(sticky_file(&view, cx), Some(1));
+        cx.simulate_keystrokes("cmd-shift-r");
+        cx.run_until_parked();
+        assert_eq!(reviewed_files(&view, cx), [1]);
+    }
+
+    #[gpui::test]
+    fn review_shortcut_saves_a_comment_being_typed_in_the_file(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        click_row(&view, KEEP_ROW, cx);
+        cx.simulate_input("note");
+        cx.simulate_keystrokes("cmd-shift-r");
+        cx.run_until_parked();
+        assert_eq!(reviewed_files(&view, cx), [0]);
+        assert!(!draft_is_open(&view, cx));
+        assert_eq!(comment(&view, KEEP_ROW, cx).as_deref(), Some("note"));
     }
 
     fn toggle_reviewed(view: &Entity<DiffView>, file: usize, cx: &mut VisualTestContext) {
