@@ -1,14 +1,18 @@
 use crate::diff::{Change, Content, Diff, DiffLine, LineKind, Row};
-use crate::display::{DisplayList, Item, Layout};
+use crate::display::{Column, DisplayList, Item, Layout};
 use crate::git::{BaseOption, Commit, Repo};
 use crate::review::{Carryover, Review};
+use crate::search::Search;
+use crate::selection::{TextPoint, TextSelection};
 use crate::symbols::{Symbol, Symbols};
 use crate::text_area::TextArea;
 use crate::theme::{MONO_FONT, Theme};
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla, KeyBinding,
-    ListAlignment, ListOffset, ListState, ScrollHandle, SharedString, Stateful, Task, Window,
-    actions, div, img, list, prelude::*, px, relative,
+    AnyElement, App, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    HighlightStyle, Hsla, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, Stateful,
+    StyledText, Subscription, Task, TextLayout, Window, actions, combine_highlights, div, img,
+    list, prelude::*, px, relative,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -17,6 +21,7 @@ actions!(
     diffront,
     [
         CopyComments,
+        CopySelection,
         SaveComment,
         CancelComment,
         Refresh,
@@ -24,7 +29,10 @@ actions!(
         ShowFiles,
         ShowCommits,
         NextCommit,
-        PreviousCommit
+        PreviousCommit,
+        ShowSearch,
+        NextMatch,
+        PreviousMatch
     ]
 );
 
@@ -36,6 +44,8 @@ const SIDE_COMMENT_INDENT: f32 = 74.;
 const FILE_GAP: f32 = 16.;
 /// Rows kept above a revealed line, enough to clear the sticky file header.
 const REVEAL_CONTEXT_ITEMS: usize = 3;
+/// Clears the sticky file header, which would otherwise cover a match at the top of the list.
+const MATCH_TOP_MARGIN: f32 = 40.;
 
 struct Draft {
     row: usize,
@@ -94,6 +104,11 @@ pub struct DiffView {
     list: ListState,
     focus: FocusHandle,
     draft: Option<Draft>,
+    selection: Option<TextSelection>,
+    click_opens_draft: bool,
+    search: Search,
+    search_input: Entity<TextArea>,
+    _search_input_changes: Subscription,
     finish_panel: Option<Entity<TextArea>>,
     base_panel: Option<BasePanel>,
     pending_update: Option<PendingUpdate>,
@@ -121,6 +136,12 @@ impl DiffView {
         let layout = Layout::SideBySide;
         let display = DisplayList::new(&review, layout);
         let list = ListState::new(display.len(), ListAlignment::Top, px(400.));
+        let search_input = cx.new(|cx| TextArea::new(String::new(), "Find in diff", cx));
+        let search_input_changes = cx.observe(&search_input, |this, _, cx| {
+            if this.search.open && this.search_input.read(cx).text() != this.search.query() {
+                this.run_search(cx);
+            }
+        });
         let mut view = Self {
             review,
             active: ViewKey::Files,
@@ -140,6 +161,11 @@ impl DiffView {
             list,
             focus,
             draft: None,
+            selection: None,
+            click_opens_draft: true,
+            search: Search::default(),
+            search_input,
+            _search_input_changes: search_input_changes,
             finish_panel: None,
             base_panel: None,
             pending_update: None,
@@ -154,6 +180,11 @@ impl DiffView {
     pub fn bind_keys(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("secondary-shift-c", CopyComments, None),
+            KeyBinding::new("secondary-c", CopySelection, Some("DiffView")),
+            KeyBinding::new("secondary-f", ShowSearch, None),
+            KeyBinding::new("secondary-g", NextMatch, None),
+            KeyBinding::new("secondary-shift-g", PreviousMatch, None),
+            KeyBinding::new("shift-enter", PreviousMatch, Some("SearchBar > TextArea")),
             KeyBinding::new("secondary-r", Refresh, None),
             KeyBinding::new("secondary-1", ShowFiles, None),
             KeyBinding::new("secondary-2", ShowCommits, None),
@@ -167,7 +198,8 @@ impl DiffView {
     }
 
     fn open_draft(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.draft.as_ref().is_some_and(|draft| draft.row == row) {
+        if let Some(draft) = self.draft.as_ref().filter(|draft| draft.row == row) {
+            window.focus(&draft.input.focus_handle(cx));
             return;
         }
         self.save_draft(cx);
@@ -186,6 +218,176 @@ impl DiffView {
             });
         });
         cx.notify();
+    }
+
+    /// A press that only dismisses a selection shouldn't also open a comment.
+    fn dismiss_selection(&mut self, cx: &mut Context<Self>) {
+        let dismissed = self.clear_selection();
+        self.click_opens_draft = !dismissed;
+        if dismissed {
+            cx.notify();
+        }
+    }
+
+    /// Returns whether any text was selected.
+    fn clear_selection(&mut self) -> bool {
+        self.selection.take().is_some_and(|sel| !sel.is_empty())
+    }
+
+    fn start_selection(
+        &mut self,
+        column: Column,
+        row: usize,
+        layout: &TextLayout,
+        position: Point<Pixels>,
+        window: &mut Window,
+    ) {
+        let point = self.text_point(row, layout, position);
+        self.selection = Some(TextSelection {
+            column,
+            anchor: point,
+            head: point,
+        });
+        window.focus(&self.focus);
+    }
+
+    fn extend_selection(
+        &mut self,
+        column: Column,
+        row: usize,
+        layout: &TextLayout,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let head = self.text_point(row, layout, position);
+        let Some(selection) = self.selection.as_mut().filter(|sel| sel.column == column) else {
+            return;
+        };
+        if selection.head != head {
+            selection.head = head;
+            self.click_opens_draft &= selection.is_empty();
+            cx.notify();
+        }
+    }
+
+    fn text_point(&self, row: usize, layout: &TextLayout, position: Point<Pixels>) -> TextPoint {
+        let Row::Line { line, .. } = &self.review.diff.rows[row] else {
+            unreachable!("only line rows are selectable");
+        };
+        let drawn = layout
+            .index_for_position(position)
+            .unwrap_or_else(|closest| closest);
+        TextPoint {
+            row,
+            offset: line.source_offset(drawn),
+        }
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(selection) = self.selection.filter(|sel| !sel.is_empty()) {
+            let text = selection.text(&self.review.diff, &self.display);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn rebuild_display(&mut self) {
+        self.selection = None;
+        self.display = DisplayList::new(&self.review, self.layout);
+        self.search.refresh(&self.review.diff, &self.display);
+    }
+
+    /// Opens search, or returns to it, seeding the query from any single-line diff selection.
+    fn show_search(&mut self, _: &ShowSearch, window: &mut Window, cx: &mut Context<Self>) {
+        let seed = self
+            .selection
+            .filter(|sel| !sel.is_empty())
+            .map(|sel| sel.text(&self.review.diff, &self.display))
+            .filter(|text| !text.contains('\n'));
+        if let Some(seed) = seed {
+            self.selection = None;
+            self.search_input
+                .update(cx, |input, cx| input.set_text(&seed, cx));
+        }
+        self.search_input
+            .update(cx, |input, cx| input.select_all(cx));
+        self.search.open = true;
+        self.focus_search(window, cx);
+        self.run_search(cx);
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.close();
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.search_input.focus_handle(cx));
+    }
+
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).text().to_string();
+        let top_row = self.top_row();
+        self.search
+            .run(query, &self.review.diff, &self.display, top_row);
+        self.reveal_current_match(cx);
+    }
+
+    fn step_match(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.search.step(delta);
+        self.reveal_current_match(cx);
+    }
+
+    fn toggle_search_case(&mut self, cx: &mut Context<Self>) {
+        self.search.case_sensitive = !self.search.case_sensitive;
+        self.run_search(cx);
+    }
+
+    /// Scrolls to the current match, unless it's already in clear view.
+    fn reveal_current_match(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        let Some(row) = self.search.current_row() else {
+            return;
+        };
+        let item = self.display.item_of(row);
+        let viewport = self.list.viewport_bounds();
+        let in_view = self.list.bounds_for_item(item).is_some_and(|bounds| {
+            bounds.top() >= viewport.top() + px(MATCH_TOP_MARGIN)
+                && bounds.bottom() <= viewport.bottom()
+        });
+        if !in_view {
+            self.list.scroll_to(ListOffset {
+                item_ix: item.saturating_sub(REVEAL_CONTEXT_ITEMS),
+                offset_in_item: px(0.),
+            });
+        }
+    }
+
+    /// A row's text, with its search matches and `extra` highlighted.
+    fn highlighted_text(
+        &self,
+        row: usize,
+        text: impl Into<SharedString>,
+        extra: Option<(std::ops::Range<usize>, HighlightStyle)>,
+        theme: &Theme,
+    ) -> StyledText {
+        let matches = self.search.matches_in(row).map(|(range, current)| {
+            let style = if current {
+                HighlightStyle {
+                    background_color: Some(theme.search_current),
+                    color: Some(theme.search_current_text),
+                    ..Default::default()
+                }
+            } else {
+                HighlightStyle {
+                    background_color: Some(theme.search_match),
+                    ..Default::default()
+                }
+            };
+            (range, style)
+        });
+        let highlights: Vec<_> = combine_highlights(matches, extra).collect();
+        StyledText::new(text).with_highlights(highlights)
     }
 
     fn save_draft(&mut self, cx: &mut Context<Self>) {
@@ -208,10 +410,12 @@ impl DiffView {
     }
 
     fn cancel_comment(&mut self, _: &CancelComment, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_update.take().is_some() {
+        if self.pending_update.take().is_some() || self.clear_selection() {
             cx.notify();
         } else if self.draft.is_some() {
             self.close_draft(window, cx);
+        } else if self.search.open {
+            self.close_search(window, cx);
         } else {
             self.close_finish_panel(window, cx);
         }
@@ -329,7 +533,7 @@ impl DiffView {
         let review = std::mem::replace(&mut self.review, next.review);
         let previous = std::mem::replace(&mut self.active, key);
         self.parked.insert(previous, Parked { review, top });
-        self.display = DisplayList::new(&self.review, self.layout);
+        self.rebuild_display();
         self.list.reset(self.display.len());
         self.list.scroll_to(next.top);
         cx.notify();
@@ -547,7 +751,7 @@ impl DiffView {
     fn toggle_layout(&mut self, _: &ToggleLayout, _: &mut Window, cx: &mut Context<Self>) {
         let top_row = self.top_row();
         self.layout = self.layout.toggled();
-        self.display = DisplayList::new(&self.review, self.layout);
+        self.rebuild_display();
         self.list.reset(self.display.len());
         if let Some(row) = top_row {
             self.jump_to_row(row, cx);
@@ -628,7 +832,7 @@ impl DiffView {
         } else {
             self.review.collapsed.remove(&file);
         }
-        self.display = DisplayList::new(&self.review, self.layout);
+        self.rebuild_display();
         if collapsed {
             let hidden = first_body_item..first_body_item + (old_len - self.display.len());
             let scrolled_into_body = hidden.contains(&self.list.logical_scroll_top().item_ix);
@@ -772,7 +976,7 @@ impl DiffView {
         if base_changed {
             self.reload_commits(window, cx);
         }
-        self.display = DisplayList::new(&self.review, self.layout);
+        self.rebuild_display();
         self.list.reset(self.display.len());
         if let Some(row) = new_top {
             self.jump_to_row(row, cx);
@@ -1267,6 +1471,9 @@ impl DiffView {
             .min_w(px(0.))
             .h_full()
             .children(commit.map(|commit| self.render_commit_bar(commit, theme, cx)))
+            .when(self.search.open, |main| {
+                main.child(self.render_search_bar(theme, cx))
+            })
             .map(|main| match placeholder {
                 Some(text) => main.child(
                     div()
@@ -1313,6 +1520,87 @@ impl DiffView {
             })
     }
 
+    fn render_search_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let (count, count_color) = match self.search.position() {
+            Some((current, total)) => (format!("{current} of {total}"), theme.muted),
+            None if self.search.query().is_empty() => (String::new(), theme.muted),
+            None => ("No results".to_string(), theme.removed),
+        };
+        div()
+            .key_context("SearchBar")
+            .on_action(cx.listener(|this, _: &SaveComment, _, cx| this.step_match(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &CancelComment, window, cx| this.close_search(window, cx)),
+            )
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .bg(theme.panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .debug_selector(|| "search-input".to_string())
+                    .w(px(280.))
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .bg(theme.background)
+                    .border_1()
+                    .border_color(theme.accent)
+                    .font_family(MONO_FONT)
+                    .text_xs()
+                    .line_height(px(20.))
+                    .child(self.search_input.clone()),
+            )
+            .child(
+                Self::button_frame("search-case", theme)
+                    .debug_selector(|| "search-case".to_string())
+                    .when(self.search.case_sensitive, |button| {
+                        button.bg(theme.selected).border_color(theme.accent)
+                    })
+                    .child("Aa")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_search_case(cx);
+                        this.focus_search(window, cx);
+                    })),
+            )
+            .child(
+                self.symbol_button("previous-match", Symbol::MatchPrevious, "Previous", theme)
+                    .debug_selector(|| "previous-match".to_string())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.step_match(-1, cx);
+                        this.focus_search(window, cx);
+                    })),
+            )
+            .child(
+                self.symbol_button("next-match", Symbol::MatchNext, "Next", theme)
+                    .debug_selector(|| "next-match".to_string())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.step_match(1, cx);
+                        this.focus_search(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_xs()
+                    .text_color(count_color)
+                    .child(count),
+            )
+            .child(
+                Self::button("close-search", "Done", theme)
+                    .debug_selector(|| "close-search".to_string())
+                    .on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx))),
+            )
+    }
+
     fn render_stats(added: usize, removed: usize, theme: &Theme) -> impl IntoElement {
         div()
             .flex()
@@ -1348,7 +1636,7 @@ impl DiffView {
                 .text_color(theme.muted)
                 .font_family(MONO_FONT)
                 .text_xs()
-                .child(header.clone())
+                .child(self.highlighted_text(ix, header.clone(), None, &theme))
                 .into_any_element(),
             Row::Line { line, .. } => row
                 .child(self.render_inline_line(ix, line, &theme, cx))
@@ -1427,7 +1715,12 @@ impl DiffView {
                             .truncate()
                             .font_family(MONO_FONT)
                             .text_sm()
-                            .child(file.path.clone()),
+                            .child(self.highlighted_text(
+                                file.first_row,
+                                file.path.clone(),
+                                None,
+                                theme,
+                            )),
                     )
                     .children(change.into_iter().map(|change| {
                         div()
@@ -1499,7 +1792,7 @@ impl DiffView {
         div()
             .flex()
             .flex_col()
-            .child(self.render_line_cell(ix, line, "line", &numbers, theme, cx))
+            .child(self.render_line_cell(ix, line, Column::Inline, &numbers, theme, cx))
             .children(self.render_annotation(ix, theme, cx))
     }
 
@@ -1524,9 +1817,9 @@ impl DiffView {
             .child(
                 div()
                     .flex()
-                    .child(self.render_side_cell(left, "left", theme, cx))
+                    .child(self.render_side_cell(left, Column::Left, theme, cx))
                     .child(divider())
-                    .child(self.render_side_cell(right, "right", theme, cx)),
+                    .child(self.render_side_cell(right, Column::Right, theme, cx)),
             )
             .when(has_notes, |item| {
                 item.child(
@@ -1542,7 +1835,7 @@ impl DiffView {
     fn render_side_cell(
         &self,
         row: Option<usize>,
-        side: &'static str,
+        column: Column,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1556,11 +1849,11 @@ impl DiffView {
         let Row::Line { line, .. } = &self.review.diff.rows[row] else {
             unreachable!("side-by-side items only refer to line rows");
         };
-        let number = match (side, line.kind) {
-            ("left", LineKind::Context { old, .. }) | (_, LineKind::Removed { old }) => old,
+        let number = match (column, line.kind) {
+            (Column::Left, LineKind::Context { old, .. }) | (_, LineKind::Removed { old }) => old,
             (_, LineKind::Context { new, .. } | LineKind::Added { new }) => new,
         };
-        self.render_line_cell(row, line, side, &[Some(number)], theme, cx)
+        self.render_line_cell(row, line, column, &[Some(number)], theme, cx)
             .flex_1()
             .min_w(px(0.))
             .into_any_element()
@@ -1570,7 +1863,7 @@ impl DiffView {
         &self,
         ix: usize,
         line: &DiffLine,
-        id: &'static str,
+        column: Column,
         numbers: &[Option<u32>],
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -1580,7 +1873,23 @@ impl DiffView {
             LineKind::Added { .. } => ("+", Some(theme.added_bg), theme.added),
             LineKind::Removed { .. } => ("-", Some(theme.removed_bg), theme.removed),
         };
+        let id = column.id();
         let group: SharedString = format!("{id}-{ix}").into();
+        let highlight = self
+            .selection
+            .and_then(|sel| sel.range_in(column, ix, line.text.len()))
+            .filter(|range| !range.is_empty())
+            .map(|range| {
+                let drawn = line.display_offset(range.start)..line.display_offset(range.end);
+                let style = HighlightStyle {
+                    background_color: Some(theme.text_selection),
+                    ..Default::default()
+                };
+                (drawn, style)
+            });
+        let text = self.highlighted_text(ix, line.display_text(), highlight, theme);
+        let press_layout = text.layout().clone();
+        let drag_layout = press_layout.clone();
         let accent = theme.accent;
         let hover = theme.hover;
         div()
@@ -1593,7 +1902,22 @@ impl DiffView {
             .cursor_pointer()
             .when_some(background, |row, background| row.bg(background))
             .hover(move |style| style.bg(hover))
-            .on_click(cx.listener(move |this, _, window, cx| this.open_draft(ix, window, cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, _| {
+                    this.start_selection(column, ix, &press_layout, event.position, window)
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                if event.dragging() {
+                    this.extend_selection(column, ix, &drag_layout, event.position, cx);
+                }
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.click_opens_draft {
+                    this.open_draft(ix, window, cx);
+                }
+            }))
             .child(
                 div()
                     .flex_shrink_0()
@@ -1626,7 +1950,8 @@ impl DiffView {
                     .flex_1()
                     .min_w(px(0.))
                     .pr_3()
-                    .child(line.text.replace('\t', "    ")),
+                    .cursor(CursorStyle::IBeam)
+                    .child(text),
             )
     }
 
@@ -2089,7 +2414,12 @@ impl Render for DiffView {
         div()
             .key_context("DiffView")
             .track_focus(&self.focus)
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.dismiss_selection(cx)))
             .on_action(cx.listener(Self::copy_comments))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::show_search))
+            .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_match(-1, cx)))
             .on_action(cx.listener(Self::save_comment))
             .on_action(cx.listener(Self::cancel_comment))
             .on_action(cx.listener(Self::refresh))
@@ -2347,6 +2677,256 @@ mod tests {
             )
         });
         assert_eq!(top, first_row);
+    }
+
+    /// Drags from the start of one line to the end of another, within a span of the row's width.
+    fn drag_lines(
+        view: &Entity<DiffView>,
+        (from, to): (usize, usize),
+        (left, right): (f32, f32),
+        cx: &mut VisualTestContext,
+    ) {
+        let at = |row, fraction, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                let bounds = view
+                    .list
+                    .bounds_for_item(view.display.item_of(row))
+                    .expect("row is laid out");
+                bounds.origin + gpui::point(bounds.size.width * fraction, px(10.))
+            })
+        };
+        let start = at(from, left, cx);
+        let end = at(to, right, cx);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    const LEFT_COLUMN: (f32, f32) = (0.01, 0.49);
+    const RIGHT_COLUMN: (f32, f32) = (0.51, 0.99);
+
+    fn draft_is_open(view: &Entity<DiffView>, cx: &mut VisualTestContext) -> bool {
+        view.read_with(cx, |view, _| view.draft.is_some())
+    }
+
+    #[gpui::test]
+    fn dragging_copies_only_the_column_it_started_in(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        drag_lines(&view, (KEEP_ROW, NEW_ROW), RIGHT_COLUMN, cx);
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard(cx).as_deref(), Some("keep\nnew"));
+
+        drag_lines(&view, (KEEP_ROW, NEW_ROW - 1), LEFT_COLUMN, cx);
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard(cx).as_deref(), Some("keep\nold"));
+    }
+
+    #[gpui::test]
+    fn dragging_copies_both_sides_in_the_inline_layout(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        cx.simulate_keystrokes("cmd-shift-d");
+        cx.run_until_parked();
+        drag_lines(&view, (KEEP_ROW, NEW_ROW), (0.01, 0.99), cx);
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard(cx).as_deref(), Some("keep\nold\nnew"));
+    }
+
+    #[gpui::test]
+    fn a_click_dismisses_a_selection_before_it_opens_a_comment(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        drag_lines(&view, (KEEP_ROW, NEW_ROW), RIGHT_COLUMN, cx);
+        assert!(!draft_is_open(&view, cx));
+
+        click_row(&view, KEEP_ROW, cx);
+        assert!(!draft_is_open(&view, cx));
+        cx.write_to_clipboard(ClipboardItem::new_string("mine".to_string()));
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard(cx).as_deref(), Some("mine"));
+
+        click_row(&view, KEEP_ROW, cx);
+        assert!(draft_is_open(&view, cx));
+    }
+
+    #[gpui::test]
+    fn clicking_the_line_with_the_open_comment_keeps_typing_in_it(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        click_row(&view, KEEP_ROW, cx);
+        cx.simulate_input("be");
+        click_row(&view, KEEP_ROW, cx);
+        cx.simulate_input("fore");
+        assert_eq!(draft_text(&view, cx), "before");
+    }
+
+    #[gpui::test]
+    fn escape_clears_a_selection(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        drag_lines(&view, (KEEP_ROW, NEW_ROW), RIGHT_COLUMN, cx);
+        cx.simulate_keystrokes("escape");
+        cx.write_to_clipboard(ClipboardItem::new_string("mine".to_string()));
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard(cx).as_deref(), Some("mine"));
+    }
+
+    #[gpui::test]
+    fn copy_keeps_the_clipboard_without_a_selection_and_defers_to_the_comment_box(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = open(cx);
+        cx.write_to_clipboard(ClipboardItem::new_string("mine".to_string()));
+        click_row(&view, KEEP_ROW, cx);
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard(cx).as_deref(), Some("mine"));
+
+        click_row(&view, KEEP_ROW, cx);
+        cx.simulate_input("note");
+        cx.simulate_keystrokes("cmd-a cmd-c");
+        assert_eq!(clipboard(cx).as_deref(), Some("note"));
+    }
+
+    fn search_position(
+        view: &Entity<DiffView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(usize, usize)> {
+        view.read_with(cx, |view, _| view.search.position())
+    }
+
+    fn search_for(query: &str, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input(query);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn find_counts_matches_as_you_type_and_steps_between_them(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        search_for("e", cx);
+        assert_eq!(search_position(&view, cx), Some((1, 6)));
+        cx.simulate_input("e");
+        cx.run_until_parked();
+        assert_eq!(search_position(&view, cx), Some((1, 1)));
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("enter");
+        assert_eq!(search_position(&view, cx), Some((2, 6)));
+        cx.simulate_keystrokes("shift-enter shift-enter");
+        assert_eq!(search_position(&view, cx), Some((6, 6)));
+        cx.simulate_keystrokes("cmd-g");
+        assert_eq!(search_position(&view, cx), Some((1, 6)));
+        cx.simulate_keystrokes("cmd-shift-g");
+        assert_eq!(search_position(&view, cx), Some((6, 6)));
+        click_selector("next-match", cx);
+        assert_eq!(search_position(&view, cx), Some((1, 6)));
+        click_selector("previous-match", cx);
+        assert_eq!(search_position(&view, cx), Some((6, 6)));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(search_position(&view, cx), Some((1, 6)));
+    }
+
+    #[gpui::test]
+    fn the_case_button_narrows_matches_and_keeps_typing_in_the_box(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        search_for("KEEP", cx);
+        assert_eq!(search_position(&view, cx), Some((1, 1)));
+        click_selector("search-case", cx);
+        assert_eq!(search_position(&view, cx), None);
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("keep");
+        cx.run_until_parked();
+        assert_eq!(search_position(&view, cx), Some((1, 1)));
+    }
+
+    #[gpui::test]
+    fn escape_closes_search_clears_highlights_and_reopening_recalls_the_query(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = open(cx);
+        search_for("keep", cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.search.open);
+            assert_eq!(view.search.matches_in(KEEP_ROW).count(), 0);
+        });
+
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        assert_eq!(search_position(&view, cx), Some((1, 1)));
+        cx.simulate_input("new");
+        cx.run_until_parked();
+        let query = view.read_with(cx, |view, _| view.search.query().to_string());
+        assert_eq!(query, "new");
+    }
+
+    #[gpui::test]
+    fn find_seeds_from_a_selection(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        drag_lines(&view, (KEEP_ROW, KEEP_ROW), RIGHT_COLUMN, cx);
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        let query = view.read_with(cx, |view, _| view.search.query().to_string());
+        assert_eq!(query, "keep");
+    }
+
+    #[gpui::test]
+    fn a_multi_line_selection_does_not_seed_the_query(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        drag_lines(&view, (KEEP_ROW, NEW_ROW), RIGHT_COLUMN, cx);
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        let query = view.read_with(cx, |view, _| view.search.query().to_string());
+        assert_eq!(query, "");
+    }
+
+    #[gpui::test]
+    fn search_keys_leave_an_open_comment_alone(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        click_row(&view, KEEP_ROW, cx);
+        cx.simulate_input("draft");
+        search_for("keep", cx);
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(draft_is_open(&view, cx));
+        assert_eq!(draft_text(&view, cx), "draft");
+        assert_eq!(comment(&view, KEEP_ROW, cx), None);
+    }
+
+    #[gpui::test]
+    fn stepping_scrolls_a_distant_match_into_view_below_the_sticky_header(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        search_for("here", cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let row = view.search.current_row().expect("a match is selected");
+            let bounds = view
+                .list
+                .bounds_for_item(view.display.item_of(row))
+                .expect("match is laid out");
+            let viewport = view.list.viewport_bounds();
+            assert!(bounds.top() >= viewport.top() + px(MATCH_TOP_MARGIN));
+            assert!(bounds.bottom() <= viewport.bottom());
+        });
+    }
+
+    #[gpui::test]
+    fn a_match_already_in_view_does_not_scroll(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        let before = view.read_with(cx, |view, _| view.list.logical_scroll_top());
+        search_for("new", cx);
+        let after = view.read_with(cx, |view, _| view.list.logical_scroll_top());
+        assert_eq!(before.item_ix, after.item_ix);
+    }
+
+    #[gpui::test]
+    fn collapsing_a_file_drops_its_matches_from_the_count(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        search_for("e", cx);
+        assert_eq!(search_position(&view, cx), Some((1, 6)));
+        click_selector("file-header-0", cx);
+        assert_eq!(search_position(&view, cx), Some((1, 3)));
     }
 
     fn click_selector(selector: &'static str, cx: &mut VisualTestContext) {

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::Range;
 
 #[derive(Debug, PartialEq)]
@@ -47,6 +48,37 @@ impl LineKind {
 pub struct DiffLine {
     pub kind: LineKind,
     pub text: String,
+}
+
+impl DiffLine {
+    const TAB: &str = "    ";
+
+    /// The text as drawn, with tabs expanded.
+    pub fn display_text(&self) -> String {
+        self.text.replace('\t', Self::TAB)
+    }
+
+    /// Converts an offset in `text` to one in `display_text`.
+    pub fn display_offset(&self, offset: usize) -> usize {
+        let tabs = self.text[..offset].matches('\t').count();
+        offset + tabs * (Self::TAB.len() - 1)
+    }
+
+    /// Converts an offset in `display_text` to one in `text`, snapping to the start of a tab.
+    pub fn source_offset(&self, display_offset: usize) -> usize {
+        let mut drawn = 0;
+        for (offset, ch) in self.text.char_indices() {
+            drawn += if ch == '\t' {
+                Self::TAB.len()
+            } else {
+                ch.len_utf8()
+            };
+            if drawn > display_offset {
+                return offset;
+            }
+        }
+        self.text.len()
+    }
 }
 
 /// One entry in the flattened, scrollable diff.
@@ -140,6 +172,15 @@ impl Diff {
             .get(file + 1)
             .map_or(self.rows.len(), |next| next.first_row);
         self.files[file].first_row + 1..end
+    }
+
+    /// The text a row draws.
+    pub fn row_text(&self, row: usize) -> Cow<'_, str> {
+        match &self.rows[row] {
+            Row::File(file) => Cow::Borrowed(&self.files[*file].path),
+            Row::Hunk { header, .. } => Cow::Borrowed(header),
+            Row::Line { line, .. } => Cow::Owned(line.display_text()),
+        }
     }
 
     pub fn parse(patch: &str) -> Self {
@@ -300,6 +341,22 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn offsets_convert_across_expanded_tabs() {
+        let line = DiffLine {
+            kind: LineKind::Added { new: 1 },
+            text: "\tå\tb".to_string(),
+        };
+        assert_eq!(line.display_text(), "    å    b");
+        assert_eq!(line.display_offset(0), 0);
+        assert_eq!(line.display_offset(1), 4);
+        assert_eq!(line.display_offset(line.text.len()), 11);
+        assert_eq!(line.source_offset(2), 0);
+        assert_eq!(line.source_offset(4), 1);
+        assert_eq!(line.source_offset(6), 3);
+        assert_eq!(line.source_offset(11), line.text.len());
     }
 
     #[test]

@@ -24,6 +24,10 @@ cancel. `⌘⇧C` copies the review as Markdown, and Finish review adds an overa
 Reviewed on a file to mark and collapse it, or click its header to just collapse it. The diff is
 side by side; `⌘⇧D` or the toolbar button switches to inline. On Linux, use `Ctrl` in place of `⌘`.
 
+Drag across text in a column to select it, and `⌘C` to copy. `⌘F` searches what's on screen,
+including file paths and hunk headers but not the bodies of collapsed files. `Enter` and `Shift+Enter`
+(or `⌘G` and `⌘⇧G`) move between matches, and `Esc` closes the search.
+
 The Files changed and Commits tabs (`⌘1`, `⌘2`) switch between the whole diff and one commit at a
 time; `⌘[` and `⌘]` step through commits. Comments stay with the view you left them in, and all of
 them are copied together.

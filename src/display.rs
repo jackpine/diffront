@@ -17,6 +17,34 @@ impl Layout {
     }
 }
 
+/// Where a diff line's text is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Column {
+    Inline,
+    Left,
+    Right,
+}
+
+impl Column {
+    pub fn id(self) -> &'static str {
+        match self {
+            Column::Inline => "line",
+            Column::Left => "left",
+            Column::Right => "right",
+        }
+    }
+
+    /// The row this column draws for `item`.
+    pub fn row_in(self, item: Item) -> Option<usize> {
+        match (self, item) {
+            (Column::Inline, Item::Full(row)) => Some(row),
+            (Column::Inline, _) => None,
+            (Column::Left, item) => item.sides().0,
+            (Column::Right, item) => item.sides().1,
+        }
+    }
+}
+
 /// One entry in the scrolling list, referring to rows of the diff.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Item {
@@ -37,6 +65,17 @@ impl Item {
             Item::Full(row) | Item::Context(row) | Item::Removed(row) | Item::Added(row) => row,
             Item::Changed { removed, .. } => removed,
         }
+    }
+
+    /// Each row this item draws, once, in on-screen order.
+    pub fn rows(self) -> impl Iterator<Item = usize> {
+        let rows = match self {
+            Item::Full(row) | Item::Context(row) | Item::Removed(row) | Item::Added(row) => {
+                [Some(row), None]
+            }
+            Item::Changed { removed, added } => [Some(removed), Some(added)],
+        };
+        rows.into_iter().flatten()
     }
 
     /// The rows shown in the left and right columns.
@@ -66,6 +105,10 @@ impl DisplayList {
 
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.item_of_row.len()
     }
 
     pub fn item(&self, ix: usize) -> Item {

@@ -2,6 +2,8 @@ mod diff;
 mod display;
 mod git;
 mod review;
+mod search;
+mod selection;
 mod symbols;
 mod text_area;
 mod theme;
@@ -15,7 +17,7 @@ use gpui::{
 };
 use review::Review;
 use text_area::TextArea;
-use view::{CopyComments, DiffView};
+use view::{CopyComments, DiffView, ShowSearch};
 
 actions!(diffront, [Quit]);
 
@@ -56,6 +58,7 @@ fn main() {
         cx.set_menus(vec![Menu {
             name: "diffront".into(),
             items: vec![
+                MenuItem::action("Find", ShowSearch),
                 MenuItem::action("Copy Comments", CopyComments),
                 MenuItem::separator(),
                 MenuItem::action("Quit", Quit),

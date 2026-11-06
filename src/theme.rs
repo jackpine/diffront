@@ -25,6 +25,9 @@ pub struct Theme {
     pub hunk_bg: Hsla,
     pub comment_bg: Hsla,
     pub text_selection: Hsla,
+    pub search_match: Hsla,
+    pub search_current: Hsla,
+    pub search_current_text: Hsla,
 }
 
 impl Global for Theme {}
@@ -55,6 +58,9 @@ impl Theme {
             hunk_bg: rgba(0x4c8dff1a).into(),
             comment_bg: rgb(0x242832).into(),
             text_selection: rgba(0x4c8dff55).into(),
+            search_match: rgba(0xffd33d4d).into(),
+            search_current: rgb(0xff9632).into(),
+            search_current_text: rgb(0x000000).into(),
         }
     }
 
@@ -76,6 +82,9 @@ impl Theme {
             hunk_bg: rgba(0x2563eb14).into(),
             comment_bg: rgb(0xf5f6f8).into(),
             text_selection: rgba(0x2563eb40).into(),
+            search_match: rgba(0xffd33d80).into(),
+            search_current: rgb(0xff9632).into(),
+            search_current_text: rgb(0x000000).into(),
         }
     }
 }

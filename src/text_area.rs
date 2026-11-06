@@ -84,6 +84,10 @@ impl TextArea {
         &self.content
     }
 
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.replace(0..self.content.len(), text, cx);
+    }
+
     pub fn bind_keys(cx: &mut App) {
         let word = if cfg!(target_os = "macos") {
             "alt"
@@ -228,7 +232,7 @@ impl TextArea {
         cx.notify();
     }
 
-    fn select_all(&mut self, cx: &mut Context<Self>) {
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
         self.selected_range = 0..self.content.len();
         self.selection_reversed = false;
         cx.notify();

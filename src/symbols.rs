@@ -17,6 +17,8 @@ pub enum Symbol {
     Next,
     Collapsed,
     Expanded,
+    MatchPrevious,
+    MatchNext,
 }
 
 impl Symbol {
@@ -34,6 +36,8 @@ impl Symbol {
             Self::Next => "chevron.right",
             Self::Collapsed => "chevron.right",
             Self::Expanded => "chevron.down",
+            Self::MatchPrevious => "chevron.up",
+            Self::MatchNext => "chevron.down",
         }
     }
 }
