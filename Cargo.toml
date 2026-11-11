@@ -11,6 +11,10 @@ unicode-segmentation = "1.13.3"
 gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+accesskit = "0.25.2"
+accesskit_macos = "0.27.2"
+futures = "0.3.34"
 objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
+raw-window-handle = "0.6.2"

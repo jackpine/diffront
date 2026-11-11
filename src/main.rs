@@ -8,6 +8,8 @@ mod symbols;
 mod text_area;
 mod theme;
 mod view;
+#[cfg(target_os = "macos")]
+mod voice;
 
 use diff::Diff;
 use git::Repo;
@@ -73,9 +75,22 @@ fn main() {
                     title: Some(format!("{} — diffront", repo.name()).into()),
                     ..Default::default()
                 }),
+                // The accessibility adapter must be installed before AppKit shows the view.
+                show: !cfg!(target_os = "macos"),
+                focus: !cfg!(target_os = "macos"),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| DiffView::new(review, repo, args, window, cx)),
+            |window, cx| {
+                cx.new(|cx| {
+                    let view = DiffView::new(review, repo, args, window, cx);
+                    #[cfg(target_os = "macos")]
+                    {
+                        view.listen_for_voice_commands(window, cx);
+                        window.activate_window();
+                    }
+                    view
+                })
+            },
         )
         .expect("failed to open window");
         cx.activate(true);

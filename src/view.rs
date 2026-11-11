@@ -7,6 +7,8 @@ use crate::selection::{TextPoint, TextSelection};
 use crate::symbols::{Symbol, Symbols};
 use crate::text_area::TextArea;
 use crate::theme::{MONO_FONT, Theme};
+#[cfg(target_os = "macos")]
+use crate::voice::{self, VoiceCommand};
 use gpui::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable,
     HighlightStyle, Hsla, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
@@ -48,9 +50,10 @@ const FILE_GAP: f32 = 16.;
 /// Rows kept above a revealed line, enough to clear the sticky file header.
 const REVEAL_CONTEXT_ITEMS: usize = 3;
 const KEY_SCROLL_DISTANCE: f32 = 60.;
+#[cfg(target_os = "macos")]
+const VOICE_SCROLL_VIEWPORT_FRACTION: f32 = 0.75;
 /// Clears the sticky file header, which would otherwise cover a match at the top of the list.
 const MATCH_TOP_MARGIN: f32 = 40.;
-
 struct Draft {
     row: usize,
     input: Entity<TextArea>,
@@ -797,9 +800,45 @@ impl DiffView {
             .first_row_at(self.list.logical_scroll_top().item_ix)
     }
 
-    fn scroll_by_key(&mut self, distance: f32, cx: &mut Context<Self>) {
-        self.list.scroll_by(px(distance));
+    fn scroll_list_by(&mut self, distance: Pixels, cx: &mut Context<Self>) {
+        self.list.scroll_by(distance);
         cx.notify();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn listen_for_voice_commands(&self, window: &mut Window, cx: &mut Context<Self>) {
+        use futures::StreamExt;
+
+        let (adapter, mut commands) = voice::publish(window);
+        cx.spawn_in(window, async move |this, cx| {
+            let _adapter = adapter;
+            while let Some(command) = commands.next().await {
+                let handled = this.update_in(cx, |this, window, cx| {
+                    this.run_voice_command(command, window, cx)
+                });
+                if handled.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_voice_command(
+        &mut self,
+        command: VoiceCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page = self.list.viewport_bounds().size.height * VOICE_SCROLL_VIEWPORT_FRACTION;
+        match command {
+            VoiceCommand::MarkReviewed => {
+                self.toggle_current_file_reviewed(&ToggleCurrentFileReviewed, window, cx)
+            }
+            VoiceCommand::PageDown => self.scroll_list_by(page, cx),
+            VoiceCommand::PageUp => self.scroll_list_by(-page, cx),
+        }
     }
 
     /// The file at the top of the list, whose header is pinned once scrolled past.
@@ -2460,13 +2499,11 @@ impl Render for DiffView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::toggle_current_file_reviewed))
             .on_action(cx.listener(|this, _: &ScrollDown, _, cx| {
-                this.scroll_by_key(KEY_SCROLL_DISTANCE, cx)
+                this.scroll_list_by(px(KEY_SCROLL_DISTANCE), cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &ScrollUp, _, cx| {
-                    this.scroll_by_key(-KEY_SCROLL_DISTANCE, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, _: &ScrollUp, _, cx| {
+                this.scroll_list_by(px(-KEY_SCROLL_DISTANCE), cx)
+            }))
             .on_action(cx.listener(Self::show_search))
             .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_match(-1, cx)))
@@ -3182,6 +3219,26 @@ mod tests {
         cx.simulate_keystrokes("k");
         cx.run_until_parked();
         assert!(scroll_position(&view, cx) < bottom);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn voice_commands_mark_the_current_file_and_scroll_by_most_of_a_page(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        let run = |command, cx: &mut VisualTestContext| {
+            view.update_in(cx, |view, window, cx| {
+                view.run_voice_command(command, window, cx)
+            });
+            cx.run_until_parked();
+        };
+        let start = scroll_position(&view, cx);
+        run(VoiceCommand::PageDown, cx);
+        let down = scroll_position(&view, cx);
+        assert!(down.0 > start.0 + 5);
+        run(VoiceCommand::PageUp, cx);
+        assert_eq!(scroll_position(&view, cx), start);
+        run(VoiceCommand::MarkReviewed, cx);
+        assert_eq!(reviewed_files(&view, cx), [0]);
     }
 
     #[gpui::test]
