@@ -10,11 +10,11 @@ use crate::theme::{MONO_FONT, Theme};
 #[cfg(target_os = "macos")]
 use crate::voice::{self, VoiceCommand};
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable,
     HighlightStyle, Hsla, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, Stateful,
-    StyledText, Subscription, Task, TextLayout, Window, actions, combine_highlights, div, img,
-    list, prelude::*, px, relative,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, SharedString,
+    Stateful, StyledText, Subscription, Task, TextLayout, Window, actions, canvas,
+    combine_highlights, div, img, list, prelude::*, px, relative,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -54,6 +54,61 @@ const KEY_SCROLL_DISTANCE: f32 = 60.;
 const VOICE_SCROLL_VIEWPORT_FRACTION: f32 = 0.75;
 /// Clears the sticky file header, which would otherwise cover a match at the top of the list.
 const MATCH_TOP_MARGIN: f32 = 40.;
+/// The height of a diff line, used to estimate the height of rows not yet laid out.
+const ROW_HEIGHT: f32 = 20.;
+const SCROLLBAR_WIDTH: f32 = 10.;
+const SCROLLBAR_MIN_THUMB: f32 = 24.;
+
+/// The diff list's scrollbar, measured in rows of estimated height.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Scrollbar {
+    track: Bounds<Pixels>,
+    thumb_height: Pixels,
+    top_row: f32,
+    max_top_row: f32,
+}
+
+impl Scrollbar {
+    fn new(track: Bounds<Pixels>, row_count: usize, top_row: f32) -> Option<Self> {
+        let rows = row_count as f32;
+        let page_rows = track.size.height / px(ROW_HEIGHT);
+        let max_top_row = rows - page_rows;
+        if max_top_row <= 0. {
+            return None;
+        }
+        let thumb_height = (track.size.height * (page_rows / rows))
+            .max(px(SCROLLBAR_MIN_THUMB))
+            .min(track.size.height);
+        Some(Self {
+            track,
+            thumb_height,
+            top_row,
+            max_top_row,
+        })
+    }
+
+    fn travel(self) -> Pixels {
+        self.track.size.height - self.thumb_height
+    }
+
+    fn thumb_top(self) -> Pixels {
+        self.travel() * (self.top_row / self.max_top_row).clamp(0., 1.)
+    }
+
+    fn contains_thumb(self, y: Pixels) -> bool {
+        let top = self.track.top() + self.thumb_top();
+        (top..top + self.thumb_height).contains(&y)
+    }
+
+    /// The top row that puts the thumb's top at `thumb_top`, from the top of the track.
+    fn row_at(self, thumb_top: Pixels) -> f32 {
+        if self.travel() <= px(0.) {
+            return 0.;
+        }
+        (thumb_top / self.travel()).clamp(0., 1.) * self.max_top_row
+    }
+}
+
 struct Draft {
     row: usize,
     input: Entity<TextArea>,
@@ -109,6 +164,8 @@ pub struct DiffView {
     layout: Layout,
     display: DisplayList,
     list: ListState,
+    /// Where the pointer holds the scrollbar thumb, from the thumb's top, while dragging it.
+    scrollbar_grab: Option<Pixels>,
     focus: FocusHandle,
     draft: Option<Draft>,
     selection: Option<TextSelection>,
@@ -166,6 +223,7 @@ impl DiffView {
             layout,
             display,
             list,
+            scrollbar_grab: None,
             focus,
             draft: None,
             selection: None,
@@ -803,6 +861,116 @@ impl DiffView {
     fn scroll_list_by(&mut self, distance: Pixels, cx: &mut Context<Self>) {
         self.list.scroll_by(distance);
         cx.notify();
+    }
+
+    fn scrollbar(&self) -> Option<Scrollbar> {
+        let top = self.list.logical_scroll_top();
+        let item_height = self
+            .list
+            .bounds_for_item(top.item_ix)
+            .map_or(px(ROW_HEIGHT), |bounds| bounds.size.height);
+        let offset = if item_height > px(0.) {
+            (top.offset_in_item / item_height).min(1.)
+        } else {
+            0.
+        };
+        Scrollbar::new(
+            self.list.viewport_bounds(),
+            self.list.item_count(),
+            top.item_ix as f32 + offset,
+        )
+    }
+
+    /// Grabs the thumb under the pointer, or centers it on the pointer when pressing the track.
+    fn press_scrollbar(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let Some(scrollbar) = self.scrollbar() else {
+            return;
+        };
+        let grab = if scrollbar.contains_thumb(y) {
+            y - scrollbar.track.top() - scrollbar.thumb_top()
+        } else {
+            scrollbar.thumb_height / 2.
+        };
+        self.scrollbar_grab = Some(grab);
+        self.drag_scrollbar(y, cx);
+    }
+
+    fn drag_scrollbar(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let (Some(grab), Some(scrollbar)) = (self.scrollbar_grab, self.scrollbar()) else {
+            return;
+        };
+        let row = scrollbar.row_at(y - scrollbar.track.top() - grab);
+        self.list.scroll_to(ListOffset {
+            item_ix: row as usize,
+            offset_in_item: px(ROW_HEIGHT) * row.fract(),
+        });
+        cx.notify();
+    }
+
+    fn release_scrollbar(&mut self, cx: &mut Context<Self>) {
+        if self.scrollbar_grab.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn render_scrollbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let scrollbar = self.scrollbar()?;
+        let dragging = self.scrollbar_grab.is_some();
+        let hover = theme.muted;
+        let view = cx.entity().downgrade();
+        Some(
+            div()
+                .id("diff-scrollbar")
+                .debug_selector(|| "diff-scrollbar".to_string())
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(px(SCROLLBAR_WIDTH))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.press_scrollbar(event.position.y, cx)
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(scrollbar.thumb_top())
+                        .h(scrollbar.thumb_height)
+                        .left(px(2.))
+                        .right(px(2.))
+                        .rounded_full()
+                        .bg(if dragging { theme.muted } else { theme.border })
+                        .hover(move |style| style.bg(hover)),
+                )
+                .when(dragging, |track| {
+                    track.child(
+                        canvas(
+                            |_, _, _| {},
+                            move |_, _, window, _| {
+                                let moved = view.clone();
+                                window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                                    moved
+                                        .update(cx, |this, cx| {
+                                            this.drag_scrollbar(event.position.y, cx)
+                                        })
+                                        .ok();
+                                });
+                                let released = view.clone();
+                                window.on_mouse_event(move |_: &MouseUpEvent, _, _, cx| {
+                                    released
+                                        .update(cx, |this, cx| this.release_scrollbar(cx))
+                                        .ok();
+                                });
+                            },
+                        )
+                        .size_0(),
+                    )
+                }),
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -1595,7 +1763,8 @@ impl DiffView {
                                 .right_0()
                                 .block_mouse_except_scroll()
                                 .child(self.render_file_header(file, theme, cx))
-                        })),
+                        }))
+                        .children(self.render_scrollbar(theme, cx)),
                 ),
             })
     }
@@ -3192,6 +3361,57 @@ mod tests {
             let top = view.list.logical_scroll_top();
             (top.item_ix, top.offset_in_item)
         })
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_the_top_row_and_maps_back() {
+        let track = Bounds::new(gpui::point(px(0.), px(100.)), gpui::size(px(10.), px(200.)));
+        assert_eq!(Scrollbar::new(track, 10, 0.), None);
+
+        let scrollbar = Scrollbar::new(track, 40, 15.).unwrap();
+        assert_eq!(scrollbar.thumb_height, px(50.));
+        assert_eq!(scrollbar.thumb_top(), px(75.));
+        assert!(scrollbar.contains_thumb(px(175.)));
+        assert!(!scrollbar.contains_thumb(px(230.)));
+        assert_eq!(scrollbar.row_at(px(75.)), 15.);
+        assert_eq!(scrollbar.row_at(px(-20.)), 0.);
+        assert_eq!(scrollbar.row_at(px(500.)), 30.);
+
+        let tiny = Scrollbar::new(track, 10_000, 0.).unwrap();
+        assert_eq!(tiny.thumb_height, px(SCROLLBAR_MIN_THUMB));
+    }
+
+    #[gpui::test]
+    fn dragging_the_scrollbar_scrolls_the_diff(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        let track = cx
+            .debug_bounds("diff-scrollbar")
+            .expect("scrollbar is painted");
+        let x = track.center().x;
+        let thumb = view.read_with(cx, |view, _| view.scrollbar().unwrap().thumb_height);
+        let grab = gpui::point(x, track.top() + thumb / 2.);
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(x, track.bottom() + px(50.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        let bottom = scroll_position(&view, cx);
+        assert!(bottom.0 > 0);
+        assert!(view.read_with(cx, |view, _| view.selection.is_none()));
+
+        cx.simulate_mouse_up(grab, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(grab, None, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(scroll_position(&view, cx), bottom);
+
+        let middle = gpui::point(x, track.center().y);
+        cx.simulate_mouse_down(middle, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(middle, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let centered = scroll_position(&view, cx);
+        assert!(centered.0 > 0 && centered.0 < bottom.0);
     }
 
     #[gpui::test]
