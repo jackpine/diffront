@@ -3,7 +3,7 @@ use crate::display::{Column, DisplayList, Item, Layout};
 use crate::git::{BaseOption, Commit, Repo};
 use crate::review::{Carryover, Review};
 use crate::search::Search;
-use crate::selection::{TextPoint, TextSelection};
+use crate::selection::{TextSelection, Unit};
 use crate::symbols::{Symbol, Symbols};
 use crate::text_area::TextArea;
 use crate::theme::{MONO_FONT, Theme};
@@ -307,16 +307,41 @@ impl DiffView {
         column: Column,
         row: usize,
         layout: &TextLayout,
-        position: Point<Pixels>,
+        event: &MouseDownEvent,
         window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        let point = self.text_point(row, layout, position);
-        self.selection = Some(TextSelection {
+        let unit = Unit::for_click_count(event.click_count);
+        let offset = self.text_offset(row, layout, event.position, unit);
+        self.selection = Some(TextSelection::new(
             column,
-            anchor: point,
-            head: point,
-        });
+            unit,
+            row,
+            &self.line(row).text,
+            offset,
+        ));
+        if unit != Unit::Character {
+            self.click_opens_draft = false;
+            self.drop_untouched_draft(row, cx);
+            cx.notify();
+        }
         window.focus(&self.focus);
+    }
+
+    /// Drops the comment box the first click of a double click opened, unless it's been typed in.
+    fn drop_untouched_draft(&mut self, row: usize, cx: &mut Context<Self>) {
+        let saved = self
+            .review
+            .comments
+            .get(&row)
+            .map_or("", |comment| comment.as_str());
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.row == row && draft.input.read(cx).text() == saved)
+        {
+            self.draft = None;
+        }
     }
 
     fn extend_selection(
@@ -327,28 +352,52 @@ impl DiffView {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let head = self.text_point(row, layout, position);
+        let Some(unit) = self.selection.map(|sel| sel.unit()) else {
+            return;
+        };
+        let offset = self.text_offset(row, layout, position, unit);
+        // Borrows the row by field so the selection can be borrowed mutably alongside it.
+        let Row::Line { line, .. } = &self.review.diff.rows[row] else {
+            unreachable!("only line rows are selectable");
+        };
         let Some(selection) = self.selection.as_mut().filter(|sel| sel.column == column) else {
             return;
         };
-        if selection.head != head {
-            selection.head = head;
+        if selection.extend(row, &line.text, offset) {
             self.click_opens_draft &= selection.is_empty();
             cx.notify();
         }
     }
 
-    fn text_point(&self, row: usize, layout: &TextLayout, position: Point<Pixels>) -> TextPoint {
+    fn line(&self, row: usize) -> &DiffLine {
         let Row::Line { line, .. } = &self.review.diff.rows[row] else {
             unreachable!("only line rows are selectable");
         };
-        let drawn = layout
+        line
+    }
+
+    /// The source offset under `position`: the nearest caret, or for words and lines the character pressed.
+    fn text_offset(
+        &self,
+        row: usize,
+        layout: &TextLayout,
+        position: Point<Pixels>,
+        unit: Unit,
+    ) -> usize {
+        let line = self.line(row);
+        let mut drawn = layout
             .index_for_position(position)
             .unwrap_or_else(|closest| closest);
-        TextPoint {
-            row,
-            offset: line.source_offset(drawn),
+        let past_pointer = layout
+            .position_for_index(drawn)
+            .is_some_and(|caret| caret.x > position.x);
+        if unit != Unit::Character && past_pointer {
+            drawn = line.display_text()[..drawn]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(ix, _)| ix);
         }
+        line.source_offset(drawn)
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
@@ -2153,8 +2202,8 @@ impl DiffView {
             .hover(move |style| style.bg(hover))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, window, _| {
-                    this.start_selection(column, ix, &press_layout, event.position, window)
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.start_selection(column, ix, &press_layout, event, window, cx)
                 }),
             )
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
@@ -2986,6 +3035,37 @@ mod tests {
         drag_lines(&view, (KEEP_ROW, NEW_ROW), (0.01, 0.99), cx);
         cx.simulate_keystrokes("cmd-c");
         assert_eq!(clipboard(cx).as_deref(), Some("keep\nold\nnew"));
+    }
+
+    #[gpui::test]
+    fn a_double_click_selects_a_word_instead_of_opening_a_comment(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        let at = view.read_with(cx, |view, _| {
+            let bounds = view
+                .list
+                .bounds_for_item(view.display.item_of(KEEP_ROW))
+                .expect("row is laid out");
+            bounds.origin + gpui::point(bounds.size.width * RIGHT_COLUMN.0, px(10.))
+        });
+        for click_count in 1..=2 {
+            cx.simulate_event(MouseDownEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers: Modifiers::none(),
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers: Modifiers::none(),
+                click_count,
+            });
+            cx.run_until_parked();
+        }
+        assert!(!draft_is_open(&view, cx));
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard(cx).as_deref(), Some("keep"));
     }
 
     #[gpui::test]

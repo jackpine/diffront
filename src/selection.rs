@@ -9,15 +9,139 @@ pub struct TextPoint {
     pub offset: usize,
 }
 
+/// How much a press selects: a double click selects words and a triple click selects lines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Unit {
+    Character,
+    Word,
+    Line,
+}
+
+impl Unit {
+    pub fn for_click_count(count: usize) -> Self {
+        match count {
+            0 | 1 => Self::Character,
+            2 => Self::Word,
+            _ => Self::Line,
+        }
+    }
+
+    /// The span of this unit around `offset` in `text`.
+    fn around(self, text: &str, offset: usize) -> Range<usize> {
+        match self {
+            Self::Character => offset..offset,
+            Self::Line => 0..text.len(),
+            Self::Word => {
+                let pressed = text[offset..]
+                    .chars()
+                    .next()
+                    .map(|ch| (offset, ch))
+                    .or_else(|| text[..offset].char_indices().next_back());
+                let Some((at, ch)) = pressed else {
+                    return offset..offset;
+                };
+                let class = CharClass::of(ch);
+                if class == CharClass::Other {
+                    return at..at + ch.len_utf8();
+                }
+                let start = text[..at]
+                    .char_indices()
+                    .rev()
+                    .take_while(|(_, ch)| CharClass::of(*ch) == class)
+                    .last()
+                    .map_or(at, |(ix, _)| ix);
+                let end = text[at..]
+                    .char_indices()
+                    .find(|(_, ch)| CharClass::of(*ch) != class)
+                    .map_or(text.len(), |(ix, _)| at + ix);
+                start..end
+            }
+        }
+    }
+}
+
+/// Characters a double click groups into one word.
+#[derive(PartialEq)]
+enum CharClass {
+    Word,
+    Space,
+    Other,
+}
+
+impl CharClass {
+    fn of(ch: char) -> Self {
+        if ch.is_alphanumeric() || ch == '_' {
+            Self::Word
+        } else if ch.is_whitespace() {
+            Self::Space
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Text highlighted in one column of the diff.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextSelection {
     pub column: Column,
-    pub anchor: TextPoint,
-    pub head: TextPoint,
+    unit: Unit,
+    /// The unit first pressed, which stays selected while dragging away from it.
+    origin: (TextPoint, TextPoint),
+    anchor: TextPoint,
+    head: TextPoint,
 }
 
 impl TextSelection {
+    pub fn unit(&self) -> Unit {
+        self.unit
+    }
+
+    /// Selects the unit at `offset` in `text`, the line shown at `row`.
+    pub fn new(column: Column, unit: Unit, row: usize, text: &str, offset: usize) -> Self {
+        let span = unit.around(text, offset);
+        let origin = (
+            TextPoint {
+                row,
+                offset: span.start,
+            },
+            TextPoint {
+                row,
+                offset: span.end,
+            },
+        );
+        Self {
+            column,
+            unit,
+            origin,
+            anchor: origin.0,
+            head: origin.1,
+        }
+    }
+
+    /// Extends to the unit at `offset` in `text`, the line shown at `row`; returns whether it changed.
+    pub fn extend(&mut self, row: usize, text: &str, offset: usize) -> bool {
+        let span = self.unit.around(text, offset);
+        let start = TextPoint {
+            row,
+            offset: span.start,
+        };
+        let (anchor, head) = if start < self.origin.0 {
+            (self.origin.1, start)
+        } else {
+            (
+                self.origin.0,
+                TextPoint {
+                    row,
+                    offset: span.end,
+                },
+            )
+        };
+        let changed = (anchor, head) != (self.anchor, self.head);
+        self.anchor = anchor;
+        self.head = head;
+        changed
+    }
+
     pub fn is_empty(&self) -> bool {
         self.anchor == self.head
     }
@@ -82,6 +206,8 @@ mod tests {
         let point = |(row, offset)| TextPoint { row, offset };
         TextSelection {
             column,
+            unit: Unit::Character,
+            origin: (point(anchor), point(anchor)),
             anchor: point(anchor),
             head: point(head),
         }
@@ -124,6 +250,51 @@ mod tests {
         );
         review.collapsed.insert(0);
         assert_eq!(text(across_files, &review, Layout::SideBySide), "here");
+    }
+
+    fn selected(selection: TextSelection, text: &str) -> &str {
+        let range = selection.range_in(selection.column, 0, text.len()).unwrap();
+        &text[range]
+    }
+
+    #[test]
+    fn a_double_click_selects_the_word_or_symbol_pressed() {
+        let text = "let foo_bar = baz(1);";
+        let word = |offset| {
+            selected(
+                TextSelection::new(Column::Inline, Unit::Word, 0, text, offset),
+                text,
+            )
+        };
+        assert_eq!(word(5), "foo_bar");
+        assert_eq!(word(4), "foo_bar");
+        assert_eq!(word(10), "foo_bar");
+        assert_eq!(word(11), " ");
+        assert_eq!(word(17), "(");
+        assert_eq!(word(text.len()), ";");
+        assert_eq!(word(0), "let");
+        assert_eq!(
+            selected(TextSelection::new(Column::Inline, Unit::Word, 0, "", 0), ""),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_triple_click_selects_the_whole_line() {
+        let text = "  indented line";
+        let line = TextSelection::new(Column::Inline, Unit::Line, 0, text, 5);
+        assert_eq!(selected(line, text), text);
+    }
+
+    #[test]
+    fn dragging_after_a_double_click_extends_by_whole_words_and_keeps_the_first() {
+        let review = review();
+        let mut words = TextSelection::new(Column::Right, Unit::Word, NEW, "new", 1);
+        assert!(words.extend(LAST, "last", 1));
+        assert_eq!(text(words, &review, Layout::SideBySide), "new\nlast");
+        assert!(words.extend(FIRST, "first", 2));
+        assert_eq!(text(words, &review, Layout::SideBySide), "first\nnew");
+        assert!(!words.extend(FIRST, "first", 4));
     }
 
     #[test]
