@@ -1,10 +1,13 @@
 mod diff;
 mod display;
 mod git;
+mod overscroll;
 mod review;
+mod scrollbar;
 mod search;
 mod selection;
 mod symbols;
+mod tada;
 mod text_area;
 mod theme;
 mod view;

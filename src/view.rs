@@ -1,23 +1,27 @@
 use crate::diff::{Change, Content, Diff, DiffLine, LineKind, Row};
 use crate::display::{Column, DisplayList, Item, Layout};
 use crate::git::{BaseOption, Commit, Repo};
+use crate::overscroll::Overscroll;
 use crate::review::{Carryover, Review};
+use crate::scrollbar::Scrollbar;
 use crate::search::Search;
 use crate::selection::{TextSelection, Unit};
 use crate::symbols::{Symbol, Symbols};
+use crate::tada::{Tada, ease_out_cubic};
 use crate::text_area::TextArea;
 use crate::theme::{MONO_FONT, Theme};
 #[cfg(target_os = "macos")]
 use crate::voice::{self, VoiceCommand};
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable,
-    HighlightStyle, Hsla, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, SharedString,
-    Stateful, StyledText, Subscription, Task, TextLayout, Window, actions, canvas,
-    combine_highlights, div, img, list, prelude::*, px, relative,
+    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity,
+    FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, ListAlignment, ListOffset, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, SharedString, Stateful, StyledText, Subscription, Task,
+    TextLayout, TouchPhase, Window, actions, canvas, combine_highlights, div, img, list,
+    prelude::*, px, relative,
 };
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 actions!(
     diffront,
@@ -50,6 +54,12 @@ const FILE_GAP: f32 = 16.;
 /// Rows kept above a revealed line, enough to clear the sticky file header.
 const REVEAL_CONTEXT_ITEMS: usize = 3;
 const KEY_SCROLL_DISTANCE: f32 = 60.;
+/// The "All done!" footer after the diff's last row.
+const FOOTER_ITEMS: usize = 1;
+/// How far below the top of the diff the current file is read, so a just-reviewed file stays in
+/// view above it.
+const CURRENT_FILE_PROBE: f32 = 64.;
+const GLIDE: Duration = Duration::from_millis(180);
 #[cfg(target_os = "macos")]
 const VOICE_SCROLL_VIEWPORT_FRACTION: f32 = 0.75;
 /// Clears the sticky file header, which would otherwise cover a match at the top of the list.
@@ -57,56 +67,32 @@ const MATCH_TOP_MARGIN: f32 = 40.;
 /// The height of a diff line, used to estimate the height of rows not yet laid out.
 const ROW_HEIGHT: f32 = 20.;
 const SCROLLBAR_WIDTH: f32 = 10.;
-const SCROLLBAR_MIN_THUMB: f32 = 24.;
 
-/// The diff list's scrollbar, measured in rows of estimated height.
+/// A scrollable part of the window that draws its own scrollbar.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Scrollbar {
-    track: Bounds<Pixels>,
-    thumb_height: Pixels,
-    top_row: f32,
-    max_top_row: f32,
+enum ScrollArea {
+    Diff,
+    Files,
+    Commits,
 }
 
-impl Scrollbar {
-    fn new(track: Bounds<Pixels>, row_count: usize, top_row: f32) -> Option<Self> {
-        let rows = row_count as f32;
-        let page_rows = track.size.height / px(ROW_HEIGHT);
-        let max_top_row = rows - page_rows;
-        if max_top_row <= 0. {
-            return None;
+impl ScrollArea {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Diff => "diff-scrollbar",
+            Self::Files => "files-scrollbar",
+            Self::Commits => "commits-scrollbar",
         }
-        let thumb_height = (track.size.height * (page_rows / rows))
-            .max(px(SCROLLBAR_MIN_THUMB))
-            .min(track.size.height);
-        Some(Self {
-            track,
-            thumb_height,
-            top_row,
-            max_top_row,
-        })
     }
+}
 
-    fn travel(self) -> Pixels {
-        self.track.size.height - self.thumb_height
-    }
-
-    fn thumb_top(self) -> Pixels {
-        self.travel() * (self.top_row / self.max_top_row).clamp(0., 1.)
-    }
-
-    fn contains_thumb(self, y: Pixels) -> bool {
-        let top = self.track.top() + self.thumb_top();
-        (top..top + self.thumb_height).contains(&y)
-    }
-
-    /// The top row that puts the thumb's top at `thumb_top`, from the top of the track.
-    fn row_at(self, thumb_top: Pixels) -> f32 {
-        if self.travel() <= px(0.) {
-            return 0.;
-        }
-        (thumb_top / self.travel()).clamp(0., 1.) * self.max_top_row
-    }
+/// A quick eased scroll that brings a file header to the top, with the gap above it scrolled away.
+#[derive(Clone, Copy, Debug)]
+struct Glide {
+    item: usize,
+    /// When it started and how far it had to go, once the item has been laid out.
+    started: Option<(Instant, Pixels)>,
+    travelled: Pixels,
 }
 
 struct Draft {
@@ -164,8 +150,12 @@ pub struct DiffView {
     layout: Layout,
     display: DisplayList,
     list: ListState,
-    /// Where the pointer holds the scrollbar thumb, from the thumb's top, while dragging it.
-    scrollbar_grab: Option<Pixels>,
+    file_scroll: ScrollHandle,
+    /// The scrollbar being dragged, and where the pointer holds its thumb from the thumb's top.
+    scrollbar_grab: Option<(ScrollArea, Pixels)>,
+    overscroll: Overscroll,
+    tada: Tada,
+    glide: Option<Glide>,
     focus: FocusHandle,
     draft: Option<Draft>,
     selection: Option<TextSelection>,
@@ -199,7 +189,7 @@ impl DiffView {
         window.focus(&focus);
         let layout = Layout::SideBySide;
         let display = DisplayList::new(&review, layout);
-        let list = ListState::new(display.len(), ListAlignment::Top, px(400.));
+        let list = ListState::new(display.len() + FOOTER_ITEMS, ListAlignment::Top, px(400.));
         let search_input = cx.new(|cx| TextArea::new(String::new(), "Find in diff", cx));
         let search_input_changes = cx.observe(&search_input, |this, _, cx| {
             if this.search.open && this.search_input.read(cx).text() != this.search.query() {
@@ -223,7 +213,11 @@ impl DiffView {
             layout,
             display,
             list,
+            file_scroll: ScrollHandle::new(),
             scrollbar_grab: None,
+            overscroll: Overscroll::default(),
+            tada: Tada::default(),
+            glide: None,
             focus,
             draft: None,
             selection: None,
@@ -651,7 +645,7 @@ impl DiffView {
         let previous = std::mem::replace(&mut self.active, key);
         self.parked.insert(previous, Parked { review, top });
         self.rebuild_display();
-        self.list.reset(self.display.len());
+        self.list.reset(self.display.len() + FOOTER_ITEMS);
         self.list.scroll_to(next.top);
         cx.notify();
     }
@@ -869,7 +863,7 @@ impl DiffView {
         let top_row = self.top_row();
         self.layout = self.layout.toggled();
         self.rebuild_display();
-        self.list.reset(self.display.len());
+        self.list.reset(self.display.len() + FOOTER_ITEMS);
         if let Some(row) = top_row {
             self.jump_to_row(row, cx);
         }
@@ -881,7 +875,7 @@ impl DiffView {
         let top = self.list.logical_scroll_top();
         let row = self.display.first_row_at(top.item_ix)?;
         let row = &self.review.diff.rows[row];
-        if matches!(row, Row::File(_)) && top.offset_in_item < px(FILE_GAP) {
+        if matches!(row, Row::File(_)) && top.offset_in_item <= px(FILE_GAP) {
             return None;
         }
         let file = row.file();
@@ -912,7 +906,22 @@ impl DiffView {
         cx.notify();
     }
 
-    fn scrollbar(&self) -> Option<Scrollbar> {
+    fn scroll_handle(&self, area: ScrollArea) -> Option<&ScrollHandle> {
+        match area {
+            ScrollArea::Diff => None,
+            ScrollArea::Files => Some(&self.file_scroll),
+            ScrollArea::Commits => Some(&self.commit_scroll),
+        }
+    }
+
+    /// The diff scrolls by rows of estimated height; the sidebar lists by pixels.
+    fn scrollbar(&self, area: ScrollArea) -> Option<Scrollbar> {
+        if let Some(handle) = self.scroll_handle(area) {
+            let track = handle.bounds();
+            let visible = track.size.height / px(1.);
+            let total = visible + handle.max_offset().height / px(1.);
+            return Scrollbar::new(track, visible, total, -handle.offset().y / px(1.));
+        }
         let top = self.list.logical_scroll_top();
         let item_height = self
             .list
@@ -923,16 +932,28 @@ impl DiffView {
         } else {
             0.
         };
+        let track = self.list.viewport_bounds();
         Scrollbar::new(
-            self.list.viewport_bounds(),
-            self.list.item_count(),
+            track,
+            track.size.height / px(ROW_HEIGHT),
+            self.list.item_count() as f32,
             top.item_ix as f32 + offset,
         )
     }
 
+    fn scroll_area_to(&self, area: ScrollArea, position: f32) {
+        match self.scroll_handle(area) {
+            Some(handle) => handle.set_offset(gpui::point(px(0.), -px(position))),
+            None => self.list.scroll_to(ListOffset {
+                item_ix: position as usize,
+                offset_in_item: px(ROW_HEIGHT) * position.fract(),
+            }),
+        }
+    }
+
     /// Grabs the thumb under the pointer, or centers it on the pointer when pressing the track.
-    fn press_scrollbar(&mut self, y: Pixels, cx: &mut Context<Self>) {
-        let Some(scrollbar) = self.scrollbar() else {
+    fn press_scrollbar(&mut self, area: ScrollArea, y: Pixels, cx: &mut Context<Self>) {
+        let Some(scrollbar) = self.scrollbar(area) else {
             return;
         };
         let grab = if scrollbar.contains_thumb(y) {
@@ -940,19 +961,21 @@ impl DiffView {
         } else {
             scrollbar.thumb_height / 2.
         };
-        self.scrollbar_grab = Some(grab);
+        self.scrollbar_grab = Some((area, grab));
         self.drag_scrollbar(y, cx);
     }
 
     fn drag_scrollbar(&mut self, y: Pixels, cx: &mut Context<Self>) {
-        let (Some(grab), Some(scrollbar)) = (self.scrollbar_grab, self.scrollbar()) else {
+        let Some((area, grab)) = self.scrollbar_grab else {
             return;
         };
-        let row = scrollbar.row_at(y - scrollbar.track.top() - grab);
-        self.list.scroll_to(ListOffset {
-            item_ix: row as usize,
-            offset_in_item: px(ROW_HEIGHT) * row.fract(),
-        });
+        let Some(scrollbar) = self.scrollbar(area) else {
+            return;
+        };
+        self.scroll_area_to(
+            area,
+            scrollbar.position_at(y - scrollbar.track.top() - grab),
+        );
         cx.notify();
     }
 
@@ -962,15 +985,20 @@ impl DiffView {
         }
     }
 
-    fn render_scrollbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let scrollbar = self.scrollbar()?;
-        let dragging = self.scrollbar_grab.is_some();
-        let hover = theme.muted;
+    fn render_scrollbar(
+        &self,
+        area: ScrollArea,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let scrollbar = self.scrollbar(area)?;
+        let dragging = self.scrollbar_grab.is_some_and(|(held, _)| held == area);
+        let hover = theme.muted.opacity(0.8);
         let view = cx.entity().downgrade();
         Some(
             div()
-                .id("diff-scrollbar")
-                .debug_selector(|| "diff-scrollbar".to_string())
+                .id(area.id())
+                .debug_selector(|| area.id().to_string())
                 .absolute()
                 .top_0()
                 .bottom_0()
@@ -979,9 +1007,9 @@ impl DiffView {
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        this.press_scrollbar(event.position.y, cx)
+                        this.press_scrollbar(area, event.position.y, cx)
                     }),
                 )
                 .child(
@@ -992,7 +1020,11 @@ impl DiffView {
                         .left(px(2.))
                         .right(px(2.))
                         .rounded_full()
-                        .bg(if dragging { theme.muted } else { theme.border })
+                        .bg(if dragging {
+                            hover
+                        } else {
+                            theme.muted.opacity(0.45)
+                        })
                         .hover(move |style| style.bg(hover)),
                 )
                 .when(dragging, |track| {
@@ -1059,8 +1091,20 @@ impl DiffView {
     }
 
     /// The file at the top of the list, whose header is pinned once scrolled past.
+    /// The file whose header is pinned, or else the one a little below the top of the diff, under
+    /// any file just reviewed and collapsed.
     fn current_file(&self) -> Option<usize> {
-        self.top_row().map(|row| self.review.diff.rows[row].file())
+        if let Some((file, _)) = self.sticky_header() {
+            return Some(file);
+        }
+        let probe = self.list.viewport_bounds().top() + px(CURRENT_FILE_PROBE);
+        let top = self.list.logical_scroll_top().item_ix;
+        let item = (top..self.display.len())
+            .map_while(|ix| Some((ix, self.list.bounds_for_item(ix)?)))
+            .find(|(_, bounds)| bounds.bottom() > probe)
+            .map_or(top, |(ix, _)| ix);
+        let row = self.display.first_row_at(item)?;
+        Some(self.review.diff.rows[row].file())
     }
 
     fn toggle_current_file_reviewed(
@@ -1069,9 +1113,18 @@ impl DiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(file) = self.current_file().filter(|_| self.showing_diff()) {
+        if let Some(file) = self.review_target().filter(|_| self.showing_diff()) {
             self.toggle_reviewed(file, window, cx);
         }
+    }
+
+    /// The current file, or while gliding past a reviewed file, the one it's gliding to.
+    fn review_target(&self) -> Option<usize> {
+        let Some(glide) = self.glide else {
+            return self.current_file();
+        };
+        let reviewed = self.review.diff.rows[self.display.first_row_at(glide.item)?].file();
+        Some(reviewed + 1).filter(|next| *next < self.review.diff.files.len())
     }
 
     fn toggle_reviewed(&mut self, file: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1080,6 +1133,19 @@ impl DiffView {
             self.review.reviewed.remove(&file);
         }
         self.set_collapsed(file, reviewed, window, cx);
+        if reviewed {
+            self.advance_past(file, cx);
+        }
+        cx.notify();
+    }
+
+    /// Glides the just-reviewed `file` to the top, leaving the next file below it as current.
+    fn advance_past(&mut self, file: usize, cx: &mut Context<Self>) {
+        self.glide = Some(Glide {
+            item: self.display.item_of(self.review.diff.files[file].first_row),
+            started: None,
+            travelled: px(0.),
+        });
         cx.notify();
     }
 
@@ -1122,9 +1188,10 @@ impl DiffView {
             let scrolled_into_body = hidden.contains(&self.list.logical_scroll_top().item_ix);
             self.list.splice(hidden, 0);
             if scrolled_into_body {
+                // Leaves the header where it was pinned, with the gap above it scrolled away.
                 self.list.scroll_to(ListOffset {
                     item_ix: header,
-                    offset_in_item: px(0.),
+                    offset_in_item: px(FILE_GAP),
                 });
             }
         } else {
@@ -1261,7 +1328,7 @@ impl DiffView {
             self.reload_commits(window, cx);
         }
         self.rebuild_display();
-        self.list.reset(self.display.len());
+        self.list.reset(self.display.len() + FOOTER_ITEMS);
         if let Some(row) = new_top {
             self.jump_to_row(row, cx);
         }
@@ -1587,17 +1654,25 @@ impl DiffView {
             })
             .collect();
         div()
-            .id("commits")
-            .track_scroll(&self.commit_scroll)
+            .relative()
             .flex()
             .flex_col()
             .flex_shrink_0()
             .max_h(relative(0.45))
-            .py_1()
-            .overflow_y_scroll()
             .border_b_1()
             .border_color(theme.border)
-            .children(items)
+            .child(
+                div()
+                    .id("commits")
+                    .track_scroll(&self.commit_scroll)
+                    .flex()
+                    .flex_col()
+                    .min_h(px(0.))
+                    .py_1()
+                    .overflow_y_scroll()
+                    .children(items),
+            )
+            .children(self.render_scrollbar(ScrollArea::Commits, theme, cx))
     }
 
     fn render_commit_bar(
@@ -1732,12 +1807,22 @@ impl DiffView {
             .when(self.showing_diff(), |sidebar| {
                 sidebar.child(
                     div()
-                        .id("files")
+                        .relative()
+                        .flex()
+                        .flex_col()
                         .flex_1()
                         .min_h(px(0.))
-                        .py_1()
-                        .overflow_y_scroll()
-                        .children(items),
+                        .child(
+                            div()
+                                .id("files")
+                                .track_scroll(&self.file_scroll)
+                                .flex_1()
+                                .min_h(px(0.))
+                                .py_1()
+                                .overflow_y_scroll()
+                                .children(items),
+                        )
+                        .children(self.render_scrollbar(ScrollArea::Files, theme, cx)),
                 )
             })
     }
@@ -1791,6 +1876,7 @@ impl DiffView {
                         .min_h(px(0.))
                         .w_full()
                         .overflow_hidden()
+                        .child(self.render_overscroll_catcher(cx))
                         .child(
                             list(
                                 self.list.clone(),
@@ -1798,6 +1884,8 @@ impl DiffView {
                                     this.render_row(ix, window, cx)
                                 }),
                             )
+                            .relative()
+                            .top(-self.overscroll.offset(Instant::now()))
                             .flex_1()
                             .min_h(px(0.))
                             .w_full(),
@@ -1813,9 +1901,165 @@ impl DiffView {
                                 .block_mouse_except_scroll()
                                 .child(self.render_file_header(file, theme, cx))
                         }))
-                        .children(self.render_scrollbar(theme, cx)),
+                        .children(self.render_scrollbar(ScrollArea::Diff, theme, cx)),
                 ),
             })
+    }
+
+    fn render_footer(&self, theme: &Theme) -> impl IntoElement {
+        div()
+            .debug_selector(|| "diff-footer".to_string())
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .pt(px(32.))
+            .pb(px(32.))
+            .child(div().w_full().h(px(1.)).mb(px(24.)).bg(theme.border))
+            .child(self.tada.render(Instant::now()))
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child("All done!"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted)
+                    .child("That's the end of the diff."),
+            )
+    }
+
+    fn footer_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.list.bounds_for_item(self.display.len())
+    }
+
+    fn at_bottom(&self) -> bool {
+        self.footer_bounds()
+            .is_some_and(|footer| footer.bottom() <= self.list.viewport_bounds().bottom() + px(1.))
+    }
+
+    fn at_top(&self) -> bool {
+        let top = self.list.logical_scroll_top();
+        top.item_ix == 0 && top.offset_in_item <= px(0.)
+    }
+
+    /// Stretches past whichever end a trackpad scroll pushes against, instead of scrolling.
+    fn overscroll_on_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        match event.touch_phase {
+            TouchPhase::Started => self.overscroll.fingers_down(),
+            TouchPhase::Ended => self.overscroll.fingers_up(now),
+            TouchPhase::Moved => {}
+        }
+        // Only trackpads and Magic Mice scroll by pixels; a mouse wheel's notches shouldn't bounce.
+        if let ScrollDelta::Pixels(delta) = event.delta {
+            let past_end = if delta.y < px(0.) {
+                self.at_bottom()
+            } else {
+                delta.y > px(0.) && self.at_top()
+            };
+            let extent = self.list.viewport_bounds().size.height;
+            if self.overscroll.scrolled(-delta.y, past_end, extent, now) {
+                cx.stop_propagation();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Catches scrolls over the diff before the list does, so a stretch can take them.
+    fn render_overscroll_catcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                    let Some(view) = view.upgrade() else {
+                        return;
+                    };
+                    if phase == DispatchPhase::Capture
+                        && view
+                            .read(cx)
+                            .list
+                            .viewport_bounds()
+                            .contains(&event.position)
+                    {
+                        view.update(cx, |this, cx| this.overscroll_on_wheel(event, cx));
+                    }
+                });
+            },
+        )
+        .size_0()
+    }
+
+    /// Starts the tada the first time the whole footer is on screen, and keeps animations running.
+    fn animate(&mut self, window: &mut Window) {
+        let now = Instant::now();
+        let viewport = self.list.viewport_bounds();
+        if self.footer_bounds().is_some_and(|footer| {
+            footer.top() >= viewport.top() && footer.bottom() <= viewport.bottom() + px(1.)
+        }) {
+            self.tada.celebrate(now);
+        }
+        let gliding = self.step_glide(now);
+        let unmeasured = |area| {
+            self.scroll_handle(area)
+                .is_some_and(|handle| handle.bounds().size.height <= px(0.))
+        };
+        let measuring = (self.showing_diff()
+            && (viewport.size.height <= px(0.)
+                || (!self.review.diff.files.is_empty() && unmeasured(ScrollArea::Files))))
+            || (self.tab == Tab::Commits
+                && !self.commits.is_empty()
+                && unmeasured(ScrollArea::Commits));
+        if measuring || gliding || self.tada.is_animating(now) || !self.overscroll.is_settled(now) {
+            window.request_animation_frame();
+        }
+    }
+
+    /// Advances the glide to `now`; returns whether it's still going.
+    fn step_glide(&mut self, now: Instant) -> bool {
+        let Some(mut glide) = self.glide.take() else {
+            return false;
+        };
+        let viewport = self.list.viewport_bounds();
+        let (started, distance) = match glide.started {
+            Some(started) => started,
+            None => {
+                let Some(target) = self.list.bounds_for_item(glide.item) else {
+                    // Too far away to have been laid out, so there's nothing to glide across.
+                    self.list.scroll_to(ListOffset {
+                        item_ix: glide.item,
+                        offset_in_item: px(0.),
+                    });
+                    return false;
+                };
+                let started = (now, target.top() + px(FILE_GAP) - viewport.top());
+                glide.started = Some(started);
+                started
+            }
+        };
+        // Stop short rather than scroll the end of the diff up off the bottom.
+        let slack = self
+            .footer_bounds()
+            .map(|footer| (footer.bottom() - viewport.bottom()).max(px(0.)));
+        let distance = match slack {
+            Some(slack) if distance > px(0.) => distance.min(glide.travelled + slack),
+            _ => distance,
+        };
+        let progress =
+            (now.saturating_duration_since(started).as_secs_f32() / GLIDE.as_secs_f32()).min(1.);
+        let travelled = distance * ease_out_cubic(progress);
+        self.list.scroll_by(travelled - glide.travelled);
+        glide.travelled = travelled;
+        let gliding = progress < 1.;
+        if gliding {
+            self.glide = Some(glide);
+        }
+        gliding
     }
 
     fn render_search_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1916,6 +2160,9 @@ impl DiffView {
     fn render_row(&mut self, list_ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.global::<Theme>();
         let row = div().w_full();
+        if list_ix == self.display.len() {
+            return row.child(self.render_footer(&theme)).into_any_element();
+        }
         let item = self.display.item(list_ix);
         let Item::Full(ix) = item else {
             return row
@@ -2707,7 +2954,8 @@ impl DiffView {
 }
 
 impl Render for DiffView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.animate(window);
         let theme = *cx.global::<Theme>();
         div()
             .key_context("DiffView")
@@ -2781,10 +3029,7 @@ impl Render for DiffView {
 mod tests {
     use super::*;
     use crate::diff::Diff;
-    use gpui::{
-        EntityInputHandler, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext,
-        VisualTestContext,
-    };
+    use gpui::{EntityInputHandler, Modifiers, TestAppContext, VisualTestContext};
 
     const PATCH: &str = "diff --git a/a.rs b/a.rs\n\
                          --- a/a.rs\n\
@@ -3427,13 +3672,34 @@ mod tests {
     }
 
     #[gpui::test]
-    fn reviewing_while_scrolled_into_a_file_returns_to_its_header(cx: &mut TestAppContext) {
+    fn reviewing_while_scrolled_into_a_file_keeps_its_header_in_view_above_the_next(
+        cx: &mut TestAppContext,
+    ) {
         let (view, cx) = open_patch(long_patch(), cx);
         view.update(cx, |view, cx| view.jump_to_row(100, cx));
         cx.run_until_parked();
+        let pinned = cx.debug_bounds("sticky-header").expect("header is pinned");
         toggle_reviewed(&view, 0, cx);
-        let top = view.read_with(cx, |view, _| view.list.logical_scroll_top().item_ix);
-        assert_eq!(top, 0);
+        assert_eq!(top_item(&view, cx), header_item(&view, 0, cx));
+        assert_eq!(top_file(&view, cx), Some(1));
+        let header = view.read_with(cx, |view, _| {
+            view.list
+                .bounds_for_item(view.display.item_of(view.review.diff.files[0].first_row))
+                .expect("header is laid out")
+        });
+        assert_eq!(header.top() + px(FILE_GAP), pinned.top());
+    }
+
+    #[gpui::test]
+    fn reviewing_a_file_further_down_glides_it_to_the_top(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        let start = scroll_position(&view, cx);
+        toggle_reviewed(&view, 1, cx);
+        assert_eq!(reviewed_files(&view, cx), [1]);
+        assert_eq!(scroll_position(&view, cx), start);
+        let (view, cx) = open_patch(long_patch(), cx);
+        toggle_reviewed(&view, 1, cx);
+        assert_eq!(top_item(&view, cx), header_item(&view, 1, cx));
     }
 
     fn scroll_position(view: &Entity<DiffView>, cx: &mut VisualTestContext) -> (usize, Pixels) {
@@ -3443,22 +3709,29 @@ mod tests {
         })
     }
 
-    #[test]
-    fn scrollbar_thumb_tracks_the_top_row_and_maps_back() {
-        let track = Bounds::new(gpui::point(px(0.), px(100.)), gpui::size(px(10.), px(200.)));
-        assert_eq!(Scrollbar::new(track, 10, 0.), None);
+    #[gpui::test]
+    fn the_file_list_has_a_scrollbar_only_when_it_overflows(cx: &mut TestAppContext) {
+        let (_, short) = open(cx);
+        short.update(|window, _| window.refresh());
+        short.run_until_parked();
+        assert!(short.debug_bounds("files-scrollbar").is_none());
 
-        let scrollbar = Scrollbar::new(track, 40, 15.).unwrap();
-        assert_eq!(scrollbar.thumb_height, px(50.));
-        assert_eq!(scrollbar.thumb_top(), px(75.));
-        assert!(scrollbar.contains_thumb(px(175.)));
-        assert!(!scrollbar.contains_thumb(px(230.)));
-        assert_eq!(scrollbar.row_at(px(75.)), 15.);
-        assert_eq!(scrollbar.row_at(px(-20.)), 0.);
-        assert_eq!(scrollbar.row_at(px(500.)), 30.);
-
-        let tiny = Scrollbar::new(track, 10_000, 0.).unwrap();
-        assert_eq!(tiny.thumb_height, px(SCROLLBAR_MIN_THUMB));
+        let many: String = (0..80)
+            .map(|ix| format!("diff --git a/f{ix}.rs b/f{ix}.rs\n@@ -0,0 +1 @@\n+x\n"))
+            .collect();
+        let (view, cx) = open_patch(many, cx);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let track = cx
+            .debug_bounds("files-scrollbar")
+            .expect("scrollbar is painted");
+        let bottom = gpui::point(track.center().x, track.bottom() - px(2.));
+        cx.simulate_mouse_down(bottom, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(bottom, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let offset = view.read_with(cx, |view, _| view.file_scroll.offset().y);
+        let max = view.read_with(cx, |view, _| view.file_scroll.max_offset().height);
+        assert_eq!(offset, -max);
     }
 
     #[gpui::test]
@@ -3468,7 +3741,9 @@ mod tests {
             .debug_bounds("diff-scrollbar")
             .expect("scrollbar is painted");
         let x = track.center().x;
-        let thumb = view.read_with(cx, |view, _| view.scrollbar().unwrap().thumb_height);
+        let thumb = view.read_with(cx, |view, _| {
+            view.scrollbar(ScrollArea::Diff).unwrap().thumb_height
+        });
         let grab = gpui::point(x, track.top() + thumb / 2.);
         cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_move(
@@ -3495,6 +3770,59 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_diff_ends_with_an_all_done_footer(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        assert!(cx.debug_bounds("diff-footer").is_none());
+        let last = view.read_with(cx, |view, _| view.list.item_count() - 1);
+        assert_eq!(view.read_with(cx, |view, _| view.tada), Tada::Waiting);
+        scroll_list_to(&view, last, cx);
+        assert!(cx.debug_bounds("diff-footer").is_some());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let tada = view.read_with(cx, |view, _| view.tada);
+        assert!(matches!(tada, Tada::Celebrating(_)));
+    }
+
+    #[gpui::test]
+    fn wheeling_past_either_end_stretches_the_diff(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        let stretch = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.overscroll.offset(Instant::now()))
+        };
+        let wheel = |dy: f32, touch_phase, cx: &mut VisualTestContext| {
+            let at = cx
+                .debug_bounds("diff-scrollbar")
+                .expect("scrollbar is painted")
+                .center()
+                - gpui::point(px(100.), px(0.));
+            cx.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Pixels(gpui::point(px(0.), px(dy))),
+                touch_phase,
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        };
+        wheel(0., TouchPhase::Started, cx);
+        wheel(40., TouchPhase::Moved, cx);
+        assert!(stretch(cx) < px(0.));
+        wheel(0., TouchPhase::Ended, cx);
+        let released = view.read_with(cx, |view, _| view.overscroll);
+        assert!(released.offset(Instant::now() + Duration::from_secs(1)) == px(0.));
+
+        let mut resting = None;
+        while resting != Some(scroll_position(&view, cx)) {
+            resting = Some(scroll_position(&view, cx));
+            wheel(-100_000., TouchPhase::Moved, cx);
+        }
+        let resting = scroll_position(&view, cx);
+        wheel(0., TouchPhase::Started, cx);
+        wheel(-40., TouchPhase::Moved, cx);
+        assert!(stretch(cx) > px(0.));
+        assert_eq!(scroll_position(&view, cx), resting);
+    }
+
+    #[gpui::test]
     fn j_and_k_scroll_and_stop_at_both_ends(cx: &mut TestAppContext) {
         let (view, cx) = open_patch(long_patch(), cx);
         let start = scroll_position(&view, cx);
@@ -3510,7 +3838,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(scroll_position(&view, cx), start);
 
-        let last = view.read_with(cx, |view, _| view.display.len() - 1);
+        let last = view.read_with(cx, |view, _| view.list.item_count() - 1);
         scroll_list_to(&view, last, cx);
         let bottom = scroll_position(&view, cx);
         cx.simulate_keystrokes("j j j");
@@ -3573,19 +3901,46 @@ mod tests {
         let (view, cx) = open_patch(long_patch(), cx);
         cx.simulate_keystrokes("cmd-shift-r");
         cx.run_until_parked();
+        finish_glide(&view, cx);
         assert_eq!(reviewed_files(&view, cx), [0]);
-        cx.simulate_keystrokes("cmd-shift-r");
-        cx.run_until_parked();
-        assert_eq!(reviewed_files(&view, cx), Vec::<usize>::new());
 
-        let second_file = view.read_with(cx, |view, _| {
-            view.display.item_of(view.review.diff.files[1].first_row)
-        });
+        let second_file = header_item(&view, 1, cx);
         scroll_list_to(&view, second_file + 1, cx);
         assert_eq!(sticky_file(&view, cx), Some(1));
         cx.simulate_keystrokes("cmd-shift-r");
         cx.run_until_parked();
-        assert_eq!(reviewed_files(&view, cx), [1]);
+        assert_eq!(reviewed_files(&view, cx), [0, 1]);
+    }
+
+    #[gpui::test]
+    fn the_review_shortcut_works_through_the_files_in_order(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        for reviewed in 1..=4 {
+            cx.simulate_keystrokes("cmd-shift-r");
+            cx.run_until_parked();
+            finish_glide(&view, cx);
+            assert_eq!(reviewed_files(&view, cx), (0..reviewed).collect::<Vec<_>>());
+            if reviewed < 4 {
+                assert_eq!(top_file(&view, cx), Some(reviewed));
+            }
+        }
+        assert!(cx.debug_bounds("diff-footer").is_some());
+    }
+
+    #[gpui::test]
+    fn pressing_the_review_shortcut_mid_glide_marks_the_next_file(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        cx.simulate_keystrokes("cmd-shift-r");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-r");
+        cx.run_until_parked();
+        finish_glide(&view, cx);
+        assert_eq!(reviewed_files(&view, cx), [0, 1]);
+        assert_eq!(top_file(&view, cx), Some(2));
+    }
+
+    fn top_file(view: &Entity<DiffView>, cx: &mut VisualTestContext) -> Option<usize> {
+        view.read_with(cx, |view, _| view.current_file())
     }
 
     #[gpui::test]
@@ -3605,6 +3960,25 @@ mod tests {
             view.toggle_reviewed(file, window, cx)
         });
         cx.run_until_parked();
+        finish_glide(view, cx);
+    }
+
+    fn finish_glide(view: &Entity<DiffView>, cx: &mut VisualTestContext) {
+        while view.read_with(cx, |view, _| view.glide.is_some()) {
+            std::thread::sleep(Duration::from_millis(20));
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+    }
+
+    fn header_item(view: &Entity<DiffView>, file: usize, cx: &mut VisualTestContext) -> usize {
+        view.read_with(cx, |view, _| {
+            view.display.item_of(view.review.diff.files[file].first_row)
+        })
+    }
+
+    fn top_item(view: &Entity<DiffView>, cx: &mut VisualTestContext) -> usize {
+        view.read_with(cx, |view, _| view.list.logical_scroll_top().item_ix)
     }
 
     #[gpui::test]
@@ -4184,18 +4558,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn marking_reviewed_from_the_sticky_header_lands_on_its_file(cx: &mut TestAppContext) {
+    fn marking_reviewed_from_the_sticky_header_moves_to_the_next_file(cx: &mut TestAppContext) {
         let (view, cx) = open_patch(long_patch(), cx);
         scroll_list_to(&view, 100, cx);
         click_selector("reviewed-0", cx);
-        let (reviewed, top) = view.read_with(cx, |view, _| {
-            (
-                view.review.reviewed.contains(&0),
-                view.list.logical_scroll_top().item_ix,
-            )
-        });
-        assert!(reviewed);
-        assert_eq!(top, 0);
+        finish_glide(&view, cx);
+        assert_eq!(reviewed_files(&view, cx), [0]);
+        assert_eq!(top_item(&view, cx), header_item(&view, 0, cx));
+        assert_eq!(top_file(&view, cx), Some(1));
         assert_eq!(sticky_file(&view, cx), None);
     }
 
