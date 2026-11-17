@@ -90,9 +90,16 @@ impl ScrollArea {
 #[derive(Clone, Copy, Debug)]
 struct Glide {
     item: usize,
-    /// When it started and how far it had to go, once the item has been laid out.
-    started: Option<(Instant, Pixels)>,
+    stage: GlideStage,
     travelled: Pixels,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GlideStage {
+    /// The list hasn't been laid out since the glide was set up.
+    AwaitingLayout,
+    Measuring,
+    Moving { started: Instant, distance: Pixels },
 }
 
 struct Draft {
@@ -153,6 +160,8 @@ pub struct DiffView {
     file_scroll: ScrollHandle,
     /// The scrollbar being dragged, and where the pointer holds its thumb from the thumb's top.
     scrollbar_grab: Option<(ScrollArea, Pixels)>,
+    /// The file the review shortcut targets, as of this frame; the list can't be queried mid-render.
+    shortcut_file: Option<usize>,
     overscroll: Overscroll,
     tada: Tada,
     glide: Option<Glide>,
@@ -215,6 +224,7 @@ impl DiffView {
             list,
             file_scroll: ScrollHandle::new(),
             scrollbar_grab: None,
+            shortcut_file: None,
             overscroll: Overscroll::default(),
             tada: Tada::default(),
             glide: None,
@@ -1107,6 +1117,17 @@ impl DiffView {
         Some(self.review.diff.rows[row].file())
     }
 
+    /// Notes the file the review shortcut targets this frame, keeping it in view in the file list.
+    fn follow_shortcut_file(&mut self) {
+        let current = self.review_target();
+        if current != self.shortcut_file
+            && let Some(file) = current
+        {
+            self.file_scroll.scroll_to_item(file);
+        }
+        self.shortcut_file = current;
+    }
+
     fn toggle_current_file_reviewed(
         &mut self,
         _: &ToggleCurrentFileReviewed,
@@ -1132,18 +1153,47 @@ impl DiffView {
         if !reviewed {
             self.review.reviewed.remove(&file);
         }
+        let pinned = self.sticky_header().is_some_and(|(pinned, _)| pinned == file);
+        let next_file_top = (reviewed && pinned).then(|| self.top_after_file(file));
         self.set_collapsed(file, reviewed, window, cx);
+        if let Some(next_file_top) = next_file_top {
+            self.lower_header_to(file, next_file_top);
+        }
         if reviewed {
             self.advance_past(file, cx);
         }
         cx.notify();
     }
 
+    /// Where whatever follows `file` starts on screen, at most the bottom of the diff.
+    fn top_after_file(&self, file: usize) -> Pixels {
+        let after = self
+            .review
+            .diff
+            .files
+            .get(file + 1)
+            .map_or(self.display.len(), |next| self.display.item_of(next.first_row));
+        let bottom = self.list.viewport_bounds().bottom();
+        self.list
+            .bounds_for_item(after)
+            .map_or(bottom, |bounds| bounds.top().min(bottom))
+    }
+
+    /// Scrolls back so `file`'s header ends near `bottom`, for the glide to bring it up from there.
+    fn lower_header_to(&mut self, file: usize, bottom: Pixels) {
+        let header = self.display.item_of(self.review.diff.files[file].first_row);
+        let rows_above = ((bottom - self.list.viewport_bounds().top()) / px(ROW_HEIGHT)) as usize;
+        self.list.scroll_to(ListOffset {
+            item_ix: header.saturating_sub(rows_above.saturating_sub(1)),
+            offset_in_item: px(0.),
+        });
+    }
+
     /// Glides the just-reviewed `file` to the top, leaving the next file below it as current.
     fn advance_past(&mut self, file: usize, cx: &mut Context<Self>) {
         self.glide = Some(Glide {
             item: self.display.item_of(self.review.diff.files[file].first_row),
-            started: None,
+            stage: GlideStage::AwaitingLayout,
             travelled: px(0.),
         });
         cx.notify();
@@ -1737,7 +1787,6 @@ impl DiffView {
     }
 
     fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.current_file();
         let items = self.review.diff.files.iter().enumerate().map(|(ix, file)| {
             let (dir, name) = file
                 .path
@@ -1752,7 +1801,7 @@ impl DiffView {
                 .px_3()
                 .py_1()
                 .cursor_pointer()
-                .when(active == Some(ix), |item| item.bg(theme.selected))
+                .when(self.shortcut_file == Some(ix), |item| item.bg(theme.selected))
                 .hover({
                     let hover = theme.hover;
                     move |style| style.bg(hover)
@@ -2026,9 +2075,14 @@ impl DiffView {
             return false;
         };
         let viewport = self.list.viewport_bounds();
-        let (started, distance) = match glide.started {
-            Some(started) => started,
-            None => {
+        let (started, distance) = match glide.stage {
+            GlideStage::Moving { started, distance } => (started, distance),
+            GlideStage::AwaitingLayout => {
+                glide.stage = GlideStage::Measuring;
+                self.glide = Some(glide);
+                return true;
+            }
+            GlideStage::Measuring => {
                 let Some(target) = self.list.bounds_for_item(glide.item) else {
                     // Too far away to have been laid out, so there's nothing to glide across.
                     self.list.scroll_to(ListOffset {
@@ -2037,9 +2091,12 @@ impl DiffView {
                     });
                     return false;
                 };
-                let started = (now, target.top() + px(FILE_GAP) - viewport.top());
-                glide.started = Some(started);
-                started
+                let distance = target.top() + px(FILE_GAP) - viewport.top();
+                glide.stage = GlideStage::Moving {
+                    started: now,
+                    distance,
+                };
+                (now, distance)
             }
         };
         // Stop short rather than scroll the end of the diff up off the bottom.
@@ -2218,6 +2275,11 @@ impl DiffView {
         let file = &self.review.diff.files[file_ix];
         let reviewed = self.review.reviewed.contains(&file_ix);
         let collapsed = self.review.collapsed.contains(&file_ix);
+        let background = if self.shortcut_file == Some(file_ix) {
+            theme.panel.blend(theme.selected)
+        } else {
+            theme.panel
+        };
         let change = match &file.change {
             Change::Modified => None,
             Change::Added => Some("new file".to_string()),
@@ -2236,7 +2298,7 @@ impl DiffView {
             .gap_3()
             .px_3()
             .py_1p5()
-            .bg(theme.panel)
+            .bg(background)
             .border_t_1()
             .border_b_1()
             .border_color(theme.border)
@@ -2956,6 +3018,7 @@ impl DiffView {
 impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.animate(window);
+        self.follow_shortcut_file();
         let theme = *cx.global::<Theme>();
         div()
             .key_context("DiffView")
@@ -3688,6 +3751,46 @@ mod tests {
                 .expect("header is laid out")
         });
         assert_eq!(header.top() + px(FILE_GAP), pinned.top());
+    }
+
+    #[gpui::test]
+    fn reviewing_a_pinned_file_glides_its_header_up_from_where_the_next_file_was(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = open_patch(format!("{}{}", long_patch(), long_patch()), cx);
+        let middle = 3;
+        let row = view.read_with(cx, |view, _| view.review.diff.files[middle].first_row + 100);
+        view.update(cx, |view, cx| view.jump_to_row(row, cx));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.toggle_reviewed(middle, window, cx));
+        let header = header_item(&view, middle, cx);
+        assert!(top_item(&view, cx) < header);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.shortcut_file), Some(middle + 1));
+        finish_glide(&view, cx);
+        assert_eq!(top_item(&view, cx), header);
+    }
+
+    #[gpui::test]
+    fn the_file_list_follows_the_current_file(cx: &mut TestAppContext) {
+        let many: String = (0..80)
+            .map(|ix| format!("diff --git a/f{ix}.rs b/f{ix}.rs\n@@ -0,0 +1 @@\n+x\n"))
+            .collect();
+        let (view, cx) = open_patch(many, cx);
+        let row = view.read_with(cx, |view, _| view.review.diff.files[70].first_row);
+        view.update(cx, |view, cx| view.jump_to_row(row, cx));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let current = view.read_with(cx, |view, _| view.current_file()).expect("a file is current");
+        let (item, list) = view.read_with(cx, |view, _| {
+            (
+                view.file_scroll.bounds_for_item(current).expect("file is laid out"),
+                view.file_scroll.bounds(),
+            )
+        });
+        let offset = view.read_with(cx, |view, _| view.file_scroll.offset().y);
+        assert!(item.top() + offset >= list.top() && item.bottom() + offset <= list.bottom());
     }
 
     #[gpui::test]
