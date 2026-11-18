@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 #[derive(Debug, PartialEq)]
 pub enum Change {
     Modified,
@@ -48,10 +50,14 @@ impl LineKind {
 pub struct DiffLine {
     pub kind: LineKind,
     pub text: String,
+    /// Byte ranges of `text` that differ from the line it's paired with.
+    pub emphasis: Vec<Range<usize>>,
 }
 
 impl DiffLine {
     const TAB: &str = "    ";
+    /// Token comparisons beyond this are too slow to be worth it.
+    const MAX_WORD_DIFF_CELLS: usize = 250_000;
 
     /// The text as drawn, with tabs expanded.
     pub fn display_text(&self) -> String {
@@ -78,6 +84,89 @@ impl DiffLine {
             }
         }
         self.text.len()
+    }
+
+    /// Marks the words that differ between `self` and `other`, unless the lines are too dissimilar.
+    fn emphasize_against(&mut self, other: &mut DiffLine) {
+        let old: Vec<_> = self.text.split_word_bound_indices().collect();
+        let new: Vec<_> = other.text.split_word_bound_indices().collect();
+        let same = |(a, b): (&(usize, &str), &(usize, &str))| a.1 == b.1;
+        let prefix = old.iter().zip(&new).take_while(|pair| same(*pair)).count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(new[prefix..].iter().rev())
+            .take_while(|pair| same(*pair))
+            .count();
+        let old_mid = &old[prefix..old.len() - suffix];
+        let new_mid = &new[prefix..new.len() - suffix];
+        if old_mid.len() * new_mid.len() > Self::MAX_WORD_DIFF_CELLS {
+            return;
+        }
+        let mut lcs = vec![vec![0u32; new_mid.len() + 1]; old_mid.len() + 1];
+        for i in (0..old_mid.len()).rev() {
+            for j in (0..new_mid.len()).rev() {
+                lcs[i][j] = if old_mid[i].1 == new_mid[j].1 {
+                    lcs[i + 1][j + 1] + 1
+                } else {
+                    lcs[i + 1][j].max(lcs[i][j + 1])
+                };
+            }
+        }
+        let mut old_kept = vec![true; old.len()];
+        let mut new_kept = vec![true; new.len()];
+        old_kept[prefix..old.len() - suffix].fill(false);
+        new_kept[prefix..new.len() - suffix].fill(false);
+        let (mut i, mut j) = (0, 0);
+        while i < old_mid.len() && j < new_mid.len() {
+            if old_mid[i].1 == new_mid[j].1 {
+                old_kept[prefix + i] = true;
+                new_kept[prefix + j] = true;
+                i += 1;
+                j += 1;
+            } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+
+        let visible_len = |tokens: &[(usize, &str)], kept: Option<&[bool]>| -> usize {
+            tokens
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| kept.is_none_or(|kept| kept[*ix]))
+                .map(|(_, (_, token))| token.trim().len())
+                .sum()
+        };
+        let common = visible_len(&old, Some(&old_kept));
+        if common * 4 < visible_len(&old, None) + visible_len(&new, None) {
+            return;
+        }
+        self.emphasis = Self::changed_ranges(&old, &old_kept);
+        other.emphasis = Self::changed_ranges(&new, &new_kept);
+    }
+
+    /// Merges runs of changed tokens, bridging whitespace between them.
+    fn changed_ranges(tokens: &[(usize, &str)], kept: &[bool]) -> Vec<Range<usize>> {
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        let mut bridge_from = None;
+        for (&(start, token), &kept) in tokens.iter().zip(kept) {
+            let end = start + token.len();
+            if !kept {
+                match (ranges.last_mut(), bridge_from) {
+                    (Some(last), Some(bridge)) if last.end == bridge => last.end = end,
+                    (Some(last), None) if last.end == start => last.end = end,
+                    _ => ranges.push(start..end),
+                }
+                bridge_from = None;
+            } else if token.trim().is_empty() {
+                bridge_from = bridge_from.or(Some(start));
+            } else {
+                bridge_from = None;
+            }
+        }
+        ranges
     }
 }
 
@@ -205,7 +294,36 @@ impl Diff {
                 hunk = diff.parse_header_line(text);
             }
         }
+        diff.emphasize_changed_words();
         diff
+    }
+
+    /// Marks the words that differ between each removed line and the added line paired with it.
+    fn emphasize_changed_words(&mut self) {
+        let mut row = 0;
+        while row < self.rows.len() {
+            let removed = self.line_run(row, |kind| matches!(kind, LineKind::Removed { .. }));
+            let added = self.line_run(removed.end, |kind| matches!(kind, LineKind::Added { .. }));
+            for (old, new) in removed.clone().zip(added.clone()) {
+                let (head, tail) = self.rows.split_at_mut(new);
+                let (Row::Line { line: old_line, .. }, Row::Line { line: new_line, .. }) =
+                    (&mut head[old], &mut tail[0])
+                else {
+                    unreachable!("runs contain only line rows");
+                };
+                old_line.emphasize_against(new_line);
+            }
+            row = added.end.max(row + 1);
+        }
+    }
+
+    /// The consecutive line rows from `start` whose kind is `wanted`.
+    pub fn line_run(&self, start: usize, wanted: fn(LineKind) -> bool) -> Range<usize> {
+        let len = self.rows[start..]
+            .iter()
+            .take_while(|row| matches!(row, Row::Line { line, .. } if wanted(line.kind)))
+            .count();
+        start..start + len
     }
 
     fn start_file(&mut self, path: String, content: Content) {
@@ -272,6 +390,7 @@ impl Diff {
             line: DiffLine {
                 kind,
                 text: chars.as_str().to_string(),
+                emphasis: Vec::new(),
             },
         });
     }
@@ -348,6 +467,7 @@ mod tests {
         let line = DiffLine {
             kind: LineKind::Added { new: 1 },
             text: "\tå\tb".to_string(),
+            emphasis: Vec::new(),
         };
         assert_eq!(line.display_text(), "    å    b");
         assert_eq!(line.display_offset(0), 0);
@@ -473,6 +593,50 @@ mod tests {
         assert_eq!(diff.files[0].content, Content::Binary);
         assert_eq!(diff.files[1].path, "merged.rs");
         assert_eq!(diff.files[1].content, Content::Combined);
+    }
+
+    fn emphasis(diff: &Diff) -> Vec<Vec<&str>> {
+        diff.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Line { line, .. } => Some(
+                    line.emphasis
+                        .iter()
+                        .map(|range| &line.text[range.clone()])
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn emphasizes_words_changed_within_paired_lines() {
+        let diff = Diff::parse(
+            "diff --git a/a b/a\n\
+             --- a/a\n\
+             +++ b/a\n\
+             @@ -1,3 +1,4 @@\n\
+             -  components: { BaseMap },\n\
+             -let total = old_value + 1;\n\
+             -fn alpha() {}\n\
+             +  components: { BaseMap, FavoriteMarkers },\n\
+             +let total = new_value + 2;\n\
+             +struct Unrelated;\n\
+             +unpaired\n",
+        );
+        assert_eq!(
+            emphasis(&diff),
+            vec![
+                vec![],
+                vec!["old_value", "1"],
+                vec![],
+                vec![", FavoriteMarkers"],
+                vec!["new_value", "2"],
+                vec![],
+                vec![],
+            ]
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::diff::{LineKind, Row};
+use crate::diff::{Diff, LineKind, Row};
 use crate::review::Review;
 
 /// How diff lines are arranged on screen.
@@ -142,7 +142,7 @@ impl DisplayList {
                         row += 1;
                     }
                     LineKind::Removed { .. } | LineKind::Added { .. } => {
-                        row = Self::push_change_block(rows, row, &mut items);
+                        row = Self::push_change_block(&review.diff, row, &mut items);
                     }
                 },
                 _ => {
@@ -155,17 +155,10 @@ impl DisplayList {
     }
 
     /// Pairs a run of removed lines with the added lines after it, returning the row that follows.
-    fn push_change_block(rows: &[Row], start: usize, items: &mut Vec<Item>) -> usize {
-        let run_end = |from: usize, wanted: fn(LineKind) -> bool| {
-            from + rows[from..]
-                .iter()
-                .take_while(|row| matches!(row, Row::Line { line, .. } if wanted(line.kind)))
-                .count()
-        };
-        let added_start = run_end(start, |kind| matches!(kind, LineKind::Removed { .. }));
-        let end = run_end(added_start, |kind| matches!(kind, LineKind::Added { .. }));
-        let mut removed = start..added_start;
-        let mut added = added_start..end;
+    fn push_change_block(diff: &Diff, start: usize, items: &mut Vec<Item>) -> usize {
+        let mut removed = diff.line_run(start, |kind| matches!(kind, LineKind::Removed { .. }));
+        let mut added = diff.line_run(removed.end, |kind| matches!(kind, LineKind::Added { .. }));
+        let end = added.end;
         loop {
             match (removed.next(), added.next()) {
                 (Some(removed), Some(added)) => items.push(Item::Changed { removed, added }),
@@ -202,7 +195,6 @@ impl DisplayList {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::Diff;
 
     const PATCH: &str = "diff --git a/a.rs b/a.rs\n\
                          --- a/a.rs\n\

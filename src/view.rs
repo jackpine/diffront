@@ -21,6 +21,7 @@ use gpui::{
     prelude::*, px, relative,
 };
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 actions!(
@@ -99,7 +100,10 @@ enum GlideStage {
     /// The list hasn't been laid out since the glide was set up.
     AwaitingLayout,
     Measuring,
-    Moving { started: Instant, distance: Pixels },
+    Moving {
+        started: Instant,
+        distance: Pixels,
+    },
 }
 
 struct Draft {
@@ -484,12 +488,13 @@ impl DiffView {
         }
     }
 
-    /// A row's text, with its search matches and `extra` highlighted.
+    /// A row's text, with its search matches and `extra` highlighted over `underlay`.
     fn highlighted_text(
         &self,
         row: usize,
         text: impl Into<SharedString>,
-        extra: Option<(std::ops::Range<usize>, HighlightStyle)>,
+        extra: Option<(Range<usize>, HighlightStyle)>,
+        underlay: Vec<(Range<usize>, HighlightStyle)>,
         theme: &Theme,
     ) -> StyledText {
         let matches = self.search.matches_in(row).map(|(range, current)| {
@@ -507,8 +512,38 @@ impl DiffView {
             };
             (range, style)
         });
-        let highlights: Vec<_> = combine_highlights(matches, extra).collect();
+        let overlays: Vec<_> = combine_highlights(matches, extra).collect();
+        // Overlapping backgrounds merge in arbitrary order, so the underlay only fills the gaps.
+        let underlay = underlay.into_iter().flat_map(|(range, style)| {
+            Self::uncovered(range, &overlays)
+                .into_iter()
+                .map(move |range| (range, style))
+        });
+        let underlay: Vec<_> = underlay.collect();
+        let highlights: Vec<_> = combine_highlights(underlay, overlays).collect();
         StyledText::new(text).with_highlights(highlights)
+    }
+
+    /// The parts of `range` outside the sorted, disjoint `covers`.
+    fn uncovered(
+        range: Range<usize>,
+        covers: &[(Range<usize>, HighlightStyle)],
+    ) -> Vec<Range<usize>> {
+        let mut gaps = Vec::new();
+        let mut start = range.start;
+        for (cover, _) in covers {
+            if cover.start >= range.end {
+                break;
+            }
+            if cover.start > start {
+                gaps.push(start..cover.start);
+            }
+            start = start.max(cover.end);
+        }
+        if start < range.end {
+            gaps.push(start..range.end);
+        }
+        gaps
     }
 
     fn save_draft(&mut self, cx: &mut Context<Self>) {
@@ -1153,7 +1188,9 @@ impl DiffView {
         if !reviewed {
             self.review.reviewed.remove(&file);
         }
-        let pinned = self.sticky_header().is_some_and(|(pinned, _)| pinned == file);
+        let pinned = self
+            .sticky_header()
+            .is_some_and(|(pinned, _)| pinned == file);
         let next_file_top = (reviewed && pinned).then(|| self.top_after_file(file));
         self.set_collapsed(file, reviewed, window, cx);
         if let Some(next_file_top) = next_file_top {
@@ -1172,7 +1209,9 @@ impl DiffView {
             .diff
             .files
             .get(file + 1)
-            .map_or(self.display.len(), |next| self.display.item_of(next.first_row));
+            .map_or(self.display.len(), |next| {
+                self.display.item_of(next.first_row)
+            });
         let bottom = self.list.viewport_bounds().bottom();
         self.list
             .bounds_for_item(after)
@@ -1801,7 +1840,9 @@ impl DiffView {
                 .px_3()
                 .py_1()
                 .cursor_pointer()
-                .when(self.shortcut_file == Some(ix), |item| item.bg(theme.selected))
+                .when(self.shortcut_file == Some(ix), |item| {
+                    item.bg(theme.selected)
+                })
                 .hover({
                     let hover = theme.hover;
                     move |style| style.bg(hover)
@@ -2238,7 +2279,7 @@ impl DiffView {
                 .text_color(theme.muted)
                 .font_family(MONO_FONT)
                 .text_xs()
-                .child(self.highlighted_text(ix, header.clone(), None, &theme))
+                .child(self.highlighted_text(ix, header.clone(), None, Vec::new(), &theme))
                 .into_any_element(),
             Row::Line { line, .. } => row
                 .child(self.render_inline_line(ix, line, &theme, cx))
@@ -2326,6 +2367,7 @@ impl DiffView {
                                 file.first_row,
                                 file.path.clone(),
                                 None,
+                                Vec::new(),
                                 theme,
                             )),
                     )
@@ -2475,11 +2517,20 @@ impl DiffView {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<gpui::Div> {
-        let (marker, background, marker_color): (_, Option<Hsla>, _) = match line.kind {
+        let (marker, backgrounds, marker_color): (_, Option<(Hsla, Hsla)>, _) = match line.kind {
             LineKind::Context { .. } => (" ", None, theme.muted),
-            LineKind::Added { .. } => ("+", Some(theme.added_bg), theme.added),
-            LineKind::Removed { .. } => ("-", Some(theme.removed_bg), theme.removed),
+            LineKind::Added { .. } => (
+                "+",
+                Some((theme.added_bg, theme.added_word_bg)),
+                theme.added,
+            ),
+            LineKind::Removed { .. } => (
+                "-",
+                Some((theme.removed_bg, theme.removed_word_bg)),
+                theme.removed,
+            ),
         };
+        let (background, word_background) = backgrounds.unzip();
         let id = column.id();
         let group: SharedString = format!("{id}-{ix}").into();
         let highlight = self
@@ -2494,7 +2545,23 @@ impl DiffView {
                 };
                 (drawn, style)
             });
-        let text = self.highlighted_text(ix, line.display_text(), highlight, theme);
+        let emphasis = word_background
+            .map(|word_background| {
+                let style = HighlightStyle {
+                    background_color: Some(word_background),
+                    ..Default::default()
+                };
+                line.emphasis
+                    .iter()
+                    .map(|range| {
+                        let drawn =
+                            line.display_offset(range.start)..line.display_offset(range.end);
+                        (drawn, style)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let text = self.highlighted_text(ix, line.display_text(), highlight, emphasis, theme);
         let press_layout = text.layout().clone();
         let drag_layout = press_layout.clone();
         let accent = theme.accent;
@@ -3762,12 +3829,17 @@ mod tests {
         let row = view.read_with(cx, |view, _| view.review.diff.files[middle].first_row + 100);
         view.update(cx, |view, cx| view.jump_to_row(row, cx));
         cx.run_until_parked();
-        view.update_in(cx, |view, window, cx| view.toggle_reviewed(middle, window, cx));
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_reviewed(middle, window, cx)
+        });
         let header = header_item(&view, middle, cx);
         assert!(top_item(&view, cx) < header);
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        assert_eq!(view.read_with(cx, |view, _| view.shortcut_file), Some(middle + 1));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.shortcut_file),
+            Some(middle + 1)
+        );
         finish_glide(&view, cx);
         assert_eq!(top_item(&view, cx), header);
     }
@@ -3782,10 +3854,14 @@ mod tests {
         view.update(cx, |view, cx| view.jump_to_row(row, cx));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        let current = view.read_with(cx, |view, _| view.current_file()).expect("a file is current");
+        let current = view
+            .read_with(cx, |view, _| view.current_file())
+            .expect("a file is current");
         let (item, list) = view.read_with(cx, |view, _| {
             (
-                view.file_scroll.bounds_for_item(current).expect("file is laid out"),
+                view.file_scroll
+                    .bounds_for_item(current)
+                    .expect("file is laid out"),
                 view.file_scroll.bounds(),
             )
         });
