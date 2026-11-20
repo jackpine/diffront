@@ -17,8 +17,8 @@ use gpui::{
     FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
     ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, StyledText,
-    Subscription, Task, TextLayout, TouchPhase, Window, actions, canvas, combine_highlights, div,
-    img, list, prelude::*, px, relative,
+    Subscription, Task, TextLayout, TouchPhase, Window, actions, canvas, combine_highlights,
+    deferred, div, img, list, prelude::*, px, relative,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -68,6 +68,10 @@ const MATCH_TOP_MARGIN: f32 = 40.;
 /// The height of a diff line, used to estimate the height of rows not yet laid out.
 const ROW_HEIGHT: f32 = 20.;
 const SCROLLBAR_WIDTH: f32 = 10.;
+const SIDEBAR_WIDTH: f32 = 280.;
+const MIN_SIDEBAR_WIDTH: f32 = 160.;
+const MIN_MAIN_WIDTH: f32 = 320.;
+const SIDEBAR_HANDLE_WIDTH: f32 = 6.;
 
 /// A scrollable part of the window that draws its own scrollbar.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,6 +176,9 @@ pub struct DiffView {
     file_scroll: ScrollHandle,
     /// The scrollbar being dragged, and where the pointer holds its thumb from the thumb's top.
     scrollbar_grab: Option<(ScrollArea, Pixels)>,
+    sidebar_width: Pixels,
+    /// While resizing the sidebar, how far the pointer is from its edge.
+    sidebar_grab: Option<Pixels>,
     /// The file the review shortcut targets, as of this frame; the list can't be queried mid-render.
     shortcut_file: Option<usize>,
     overscroll: Overscroll,
@@ -237,6 +244,8 @@ impl DiffView {
             list,
             file_scroll: ScrollHandle::new(),
             scrollbar_grab: None,
+            sidebar_width: px(SIDEBAR_WIDTH),
+            sidebar_grab: None,
             shortcut_file: None,
             overscroll: Overscroll::default(),
             tada: Tada::default(),
@@ -1194,6 +1203,80 @@ impl DiffView {
         }
     }
 
+    fn drag_sidebar(&mut self, x: Pixels, window_width: Pixels, cx: &mut Context<Self>) {
+        let Some(grab) = self.sidebar_grab else {
+            return;
+        };
+        let max = (window_width - px(MIN_MAIN_WIDTH)).max(px(MIN_SIDEBAR_WIDTH));
+        self.sidebar_width = (x - grab).clamp(px(MIN_SIDEBAR_WIDTH), max);
+        cx.notify();
+    }
+
+    fn render_sidebar_handle(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let dragging = self.sidebar_grab.is_some();
+        let view = cx.entity().downgrade();
+        let accent = theme.accent;
+        deferred(
+            div()
+                .id("sidebar-handle")
+                .debug_selector(|| "sidebar-handle".to_string())
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(px(-SIDEBAR_HANDLE_WIDTH / 2. - 1.))
+                .w(px(SIDEBAR_HANDLE_WIDTH))
+                .occlude()
+                .cursor(CursorStyle::ResizeLeftRight)
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(2.))
+                        .h_full()
+                        .when(dragging, |line| line.bg(accent))
+                        .hover(move |line| line.bg(accent)),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.sidebar_grab = Some(event.position.x - this.sidebar_width);
+                        cx.notify();
+                    }),
+                )
+                .when(dragging, |handle| {
+                    handle.child(
+                        canvas(
+                            |_, _, _| {},
+                            move |_, _, window, _| {
+                                let moved = view.clone();
+                                window.on_mouse_event(
+                                    move |event: &MouseMoveEvent, _, window, cx| {
+                                        let width = window.viewport_size().width;
+                                        moved
+                                            .update(cx, |this, cx| {
+                                                this.drag_sidebar(event.position.x, width, cx)
+                                            })
+                                            .ok();
+                                    },
+                                );
+                                let released = view.clone();
+                                window.on_mouse_event(move |_: &MouseUpEvent, _, _, cx| {
+                                    released
+                                        .update(cx, |this, cx| {
+                                            this.sidebar_grab = None;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                });
+                            },
+                        )
+                        .size_0(),
+                    )
+                }),
+        )
+    }
+
     fn render_scrollbar(
         &self,
         area: ScrollArea,
@@ -2058,10 +2141,11 @@ impl DiffView {
         });
         let items: Vec<_> = items.collect();
         div()
+            .relative()
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(280.))
+            .w(self.sidebar_width)
             .h_full()
             .bg(theme.panel)
             .border_r_1()
@@ -2101,6 +2185,7 @@ impl DiffView {
                         .children(self.render_scrollbar(ScrollArea::Files, theme, cx)),
                 )
             })
+            .child(self.render_sidebar_handle(theme, cx))
     }
 
     fn render_main(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4172,6 +4257,39 @@ mod tests {
         let offset = view.read_with(cx, |view, _| view.file_scroll.offset().y);
         let max = view.read_with(cx, |view, _| view.file_scroll.max_offset().height);
         assert_eq!(offset, -max);
+    }
+
+    #[gpui::test]
+    fn dragging_the_sidebar_edge_resizes_it_within_limits(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        let handle = cx
+            .debug_bounds("sidebar-handle")
+            .expect("handle is painted");
+        let width = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.sidebar_width);
+        let start = handle.center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(100.), px(0.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert_eq!(width(cx), px(SIDEBAR_WIDTH + 100.));
+        assert!(view.read_with(cx, |view, _| view.selection.is_none()));
+
+        cx.simulate_mouse_move(
+            gpui::point(px(0.), start.y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert_eq!(width(cx), px(MIN_SIDEBAR_WIDTH));
+
+        cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(50.), px(0.)),
+            None,
+            Modifiers::none(),
+        );
+        assert_eq!(width(cx), px(MIN_SIDEBAR_WIDTH));
     }
 
     #[gpui::test]
