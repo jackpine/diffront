@@ -1,6 +1,6 @@
 use crate::diff::{Change, Content, Diff, DiffLine, LineKind, Row};
 use crate::display::{Column, DisplayList, Item, Layout};
-use crate::git::{BaseOption, Commit, Repo};
+use crate::git::{BaseOption, Commit, Repo, Revision, RevisionKey};
 use crate::overscroll::Overscroll;
 use crate::review::{Carryover, Review};
 use crate::scrollbar::Scrollbar;
@@ -121,7 +121,7 @@ enum Tab {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ViewKey {
     Files,
-    Commit(String),
+    Revision(RevisionKey),
 }
 
 /// A review that isn't on screen, with where it was scrolled to.
@@ -149,9 +149,9 @@ pub struct DiffView {
     active: ViewKey,
     parked: BTreeMap<ViewKey, Parked>,
     tab: Tab,
-    commits: Vec<Commit>,
+    commits: Vec<Revision>,
     commit_scroll: ScrollHandle,
-    selected_commit: Option<String>,
+    selected_commit: Option<RevisionKey>,
     commits_load: Option<Task<()>>,
     commit_load: Option<Task<()>>,
     overall: String,
@@ -639,7 +639,7 @@ impl DiffView {
             .chain(
                 self.commits
                     .iter()
-                    .map(|commit| ViewKey::Commit(commit.sha.clone())),
+                    .map(|revision| ViewKey::Revision(revision.key())),
             )
             .filter_map(|key| {
                 let review = self.review_for(&key)?;
@@ -663,10 +663,10 @@ impl DiffView {
         match self.tab {
             Tab::Files => true,
             Tab::Commits => {
-                let Some(sha) = &self.selected_commit else {
+                let Some(selected) = &self.selected_commit else {
                     return false;
                 };
-                matches!(&self.active, ViewKey::Commit(active) if active == sha)
+                matches!(&self.active, ViewKey::Revision(active) if active == selected)
             }
         }
     }
@@ -715,45 +715,54 @@ impl DiffView {
     fn select_listed_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self
             .selected_commit
-            .as_ref()
-            .filter(|sha| self.commits.iter().any(|commit| commit.sha == **sha))
-            .or(self.commits.last().map(|commit| &commit.sha))
-            .cloned();
+            .clone()
+            .filter(|key| self.position_of(key).is_some())
+            .or(self.commits.last().map(Revision::key));
         match selected {
-            Some(sha) => self.show_commit(sha, window, cx),
+            Some(key) => self.show_commit(key, window, cx),
             None => self.selected_commit = None,
         }
     }
 
-    fn select_commit(&mut self, sha: String) {
-        match self.commits.iter().position(|commit| commit.sha == sha) {
+    fn position_of(&self, key: &RevisionKey) -> Option<usize> {
+        self.commits
+            .iter()
+            .position(|revision| revision.key() == *key)
+    }
+
+    fn revision(&self, key: &RevisionKey) -> Option<&Revision> {
+        self.commits.iter().find(|revision| revision.key() == *key)
+    }
+
+    fn select_commit(&mut self, key: RevisionKey) {
+        match self.position_of(&key) {
             // Unlike scrolling to an item, this also works before the list's first layout.
             Some(ix) if ix + 1 == self.commits.len() => self.commit_scroll.scroll_to_bottom(),
             Some(ix) => self.commit_scroll.scroll_to_item(ix),
             None => {}
         }
-        self.selected_commit = Some(sha);
+        self.selected_commit = Some(key);
     }
 
-    fn show_commit(&mut self, sha: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_commit(&mut self, key: RevisionKey, window: &mut Window, cx: &mut Context<Self>) {
         self.save_open_draft(window, cx);
-        self.select_commit(sha.clone());
-        let key = ViewKey::Commit(sha.clone());
-        if self.review_for(&key).is_some() {
+        self.select_commit(key.clone());
+        let view_key = ViewKey::Revision(key.clone());
+        if self.review_for(&view_key).is_some() {
             self.commit_load = None;
-            self.activate(key, cx);
+            self.activate(view_key, cx);
             return;
         }
         let repo = self.repo.clone();
         let patch = {
-            let sha = sha.clone();
-            cx.background_spawn(async move { repo.commit_patch(&sha) })
+            let key = key.clone();
+            cx.background_spawn(async move { repo.revision_patch(&key) })
         };
         self.commit_load = Some(cx.spawn_in(window, async move |this, cx| {
             let patch = patch.await;
             this.update_in(cx, |this, _, cx| {
                 this.commit_load = None;
-                this.finish_commit_load(sha, patch, cx);
+                this.finish_commit_load(key, patch, cx);
             })
             .ok();
         }));
@@ -762,7 +771,7 @@ impl DiffView {
 
     fn finish_commit_load(
         &mut self,
-        sha: String,
+        key: RevisionKey,
         patch: Result<String, String>,
         cx: &mut Context<Self>,
     ) {
@@ -773,15 +782,10 @@ impl DiffView {
                 return;
             }
         };
-        let source = self
-            .commits
-            .iter()
-            .find(|commit| commit.sha == sha)
-            .map_or_else(
-                || format!("commit {sha}"),
-                |commit| format!("commit {} ({})", commit.short, commit.subject),
-            );
-        let key = ViewKey::Commit(sha);
+        let Some(source) = self.revision(&key).map(Revision::source) else {
+            return;
+        };
+        let key = ViewKey::Revision(key);
         self.parked.insert(
             key.clone(),
             Parked {
@@ -799,28 +803,41 @@ impl DiffView {
         if self.tab != Tab::Commits {
             return;
         }
-        let current = self
+        let target = self
             .selected_commit
             .as_ref()
-            .and_then(|sha| self.commits.iter().position(|commit| commit.sha == *sha));
-        let target = current
+            .and_then(|key| self.position_of(key))
             .and_then(|current| current.checked_add_signed(delta))
             .and_then(|target| self.commits.get(target))
-            .map(|commit| commit.sha.clone());
-        if let Some(sha) = target {
-            self.show_commit(sha, window, cx);
+            .map(Revision::key);
+        if let Some(key) = target {
+            self.show_commit(key, window, cx);
         }
     }
 
     fn reload_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let repo = self.repo.clone();
         let args = self.args.clone();
-        let commits = cx.background_spawn(async move { repo.commits(&args).unwrap_or_default() });
+        let loaded: Vec<RevisionKey> = [RevisionKey::Staged, RevisionKey::Unstaged]
+            .into_iter()
+            .filter(|key| self.review_for(&ViewKey::Revision(key.clone())).is_some())
+            .collect();
+        let reload = cx.background_spawn(async move {
+            let revisions = repo.revisions(&args).unwrap_or_default();
+            let patches: Vec<_> = loaded
+                .into_iter()
+                .map(|key| {
+                    let patch = repo.revision_patch(&key);
+                    (key, patch)
+                })
+                .collect();
+            (revisions, patches)
+        });
         self.commits_load = Some(cx.spawn_in(window, async move |this, cx| {
-            let commits = commits.await;
+            let (revisions, patches) = reload.await;
             this.update_in(cx, |this, window, cx| {
                 this.commits_load = None;
-                this.finish_commits(commits, window, cx);
+                this.finish_commits(revisions, patches, window, cx);
             })
             .ok();
         }));
@@ -829,29 +846,85 @@ impl DiffView {
     /// Replaces the commit list, keeping commits with comments even if they left the range.
     fn finish_commits(
         &mut self,
-        commits: Vec<Commit>,
+        revisions: Vec<Revision>,
+        uncommitted_patches: Vec<(RevisionKey, Result<String, String>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut kept = Vec::new();
-        for commit in std::mem::take(&mut self.commits) {
-            let listed = commits.iter().any(|new| new.sha == commit.sha);
+        for revision in std::mem::take(&mut self.commits) {
+            let Revision::Commit(commit) = revision else {
+                continue;
+            };
+            let key = RevisionKey::Commit(commit.sha.clone());
+            let listed = revisions.iter().any(|new| new.key() == key);
             let has_comments = self
-                .review_for(&ViewKey::Commit(commit.sha.clone()))
+                .review_for(&ViewKey::Revision(key))
                 .is_some_and(|review| !review.comments.is_empty());
             if !listed && has_comments {
-                kept.push(Commit {
+                kept.push(Revision::Commit(Commit {
                     in_range: false,
                     ..commit
-                });
+                }));
             }
         }
-        kept.extend(commits);
+        kept.extend(revisions);
         self.commits = kept;
+        let lost: usize = uncommitted_patches
+            .into_iter()
+            .map(|(key, patch)| self.refresh_uncommitted(key, patch, cx))
+            .sum();
         if self.tab == Tab::Commits {
             self.select_listed_commit(window, cx);
         }
+        match lost {
+            0 => {}
+            1 => self.show_status("1 comment on uncommitted changes was dropped".into(), cx),
+            count => self.show_status(
+                format!("{count} comments on uncommitted changes were dropped"),
+                cx,
+            ),
+        }
         cx.notify();
+    }
+
+    /// Moves an uncommitted review onto its newer diff, returning how many comments were lost.
+    fn refresh_uncommitted(
+        &mut self,
+        key: RevisionKey,
+        patch: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let view_key = ViewKey::Revision(key.clone());
+        let source = self.revision(&key).map(Revision::source);
+        let (Some(source), Ok(patch)) = (source, patch) else {
+            let lost = self
+                .review_for(&view_key)
+                .map_or(0, |review| review.comments.len());
+            if self.active == view_key {
+                self.activate(ViewKey::Files, cx);
+            }
+            self.parked.remove(&view_key);
+            return lost;
+        };
+        let diff = Diff::parse(&patch);
+        let is_active = self.active == view_key;
+        let review = if is_active {
+            &mut self.review
+        } else {
+            match self.parked.get_mut(&view_key) {
+                Some(parked) => &mut parked.review,
+                None => return 0,
+            }
+        };
+        let carryover = review.carry_over(&diff);
+        let lost = carryover.lost.len();
+        review.apply_update(source, diff, carryover);
+        if is_active {
+            self.rebuild_display();
+            self.list.reset(self.display.len() + FOOTER_ITEMS);
+        }
+        lost
     }
 
     fn reveal_comment(
@@ -865,9 +938,9 @@ impl DiffView {
         self.commit_load = None;
         match &key {
             ViewKey::Files => self.tab = Tab::Files,
-            ViewKey::Commit(sha) => {
+            ViewKey::Revision(revision) => {
                 self.tab = Tab::Commits;
-                self.select_commit(sha.clone());
+                self.select_commit(revision.clone());
             }
         }
         self.activate(key, cx);
@@ -1675,20 +1748,48 @@ impl DiffView {
         let items: Vec<_> = self
             .commits
             .iter()
-            .map(|commit| {
-                let sha = commit.sha.clone();
+            .map(|revision| {
+                let key = revision.key();
                 let comments = self
-                    .review_for(&ViewKey::Commit(sha.clone()))
+                    .review_for(&ViewKey::Revision(key.clone()))
                     .map_or(0, |review| review.comments.len());
-                let selected = self.selected_commit.as_ref() == Some(&sha);
-                let identity = if commit.in_range {
-                    commit.short.clone()
-                } else {
-                    format!("{} · not in range", commit.short)
+                let selected = self.selected_commit.as_ref() == Some(&key);
+                let details = match revision {
+                    Revision::Commit(commit) => {
+                        let identity = if commit.in_range {
+                            commit.short.clone()
+                        } else {
+                            format!("{} · not in range", commit.short)
+                        };
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(div().flex_shrink_0().font_family(MONO_FONT).child(identity))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .child(commit.author.clone()),
+                            )
+                            .child(div().flex_shrink_0().child(commit.when.clone()))
+                    }
+                    Revision::Staged | Revision::Unstaged => div()
+                        .truncate()
+                        .font_family(MONO_FONT)
+                        .child(revision.source()),
+                };
+                let subject = div()
+                    .truncate()
+                    .text_sm()
+                    .child(revision.subject().to_string());
+                let subject = match revision {
+                    Revision::Commit(_) => subject,
+                    Revision::Staged | Revision::Unstaged => subject.italic(),
                 };
                 div()
-                    .id(SharedString::from(format!("commit-{sha}")))
-                    .debug_selector(|| format!("commit-{}", commit.subject))
+                    .id(SharedString::from(format!("commit-{}", revision.label())))
+                    .debug_selector(|| format!("commit-{}", revision.subject()))
                     .flex()
                     .flex_shrink_0()
                     .items_center()
@@ -1699,34 +1800,14 @@ impl DiffView {
                     .hover(move |style| style.bg(hover))
                     .when(selected, |item| item.bg(theme.selected))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.show_commit(sha.clone(), window, cx)
+                        this.show_commit(key.clone(), window, cx)
                     }))
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .child(div().truncate().text_sm().child(commit.subject.clone()))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .text_xs()
-                                    .text_color(theme.muted)
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .font_family(MONO_FONT)
-                                            .child(identity),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .truncate()
-                                            .child(commit.author.clone()),
-                                    )
-                                    .child(div().flex_shrink_0().child(commit.when.clone())),
-                            ),
+                            .child(subject)
+                            .child(details.text_xs().text_color(theme.muted)),
                     )
                     .when(comments > 0, |item| {
                         item.child(
@@ -1766,15 +1847,21 @@ impl DiffView {
 
     fn render_commit_bar(
         &self,
-        commit: &Commit,
+        revision: &Revision,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let position = self
-            .commits
-            .iter()
-            .position(|candidate| candidate.sha == commit.sha)
-            .map_or(0, |ix| ix + 1);
+        let position = self.position_of(&revision.key()).map_or(0, |ix| ix + 1);
+        let total = self.commits.len();
+        let details = match revision {
+            Revision::Commit(commit) => {
+                format!(
+                    "{} · {} · {position} of {total}",
+                    commit.author, commit.when
+                )
+            }
+            Revision::Staged | Revision::Unstaged => format!("{position} of {total}"),
+        };
         div()
             .flex()
             .flex_shrink_0()
@@ -1791,7 +1878,7 @@ impl DiffView {
                     .font_family(MONO_FONT)
                     .text_xs()
                     .text_color(theme.muted)
-                    .child(commit.short.clone()),
+                    .child(revision.label().to_string()),
             )
             .child(
                 div()
@@ -1799,19 +1886,14 @@ impl DiffView {
                     .min_w(px(0.))
                     .truncate()
                     .text_sm()
-                    .child(commit.subject.clone()),
+                    .child(revision.subject().to_string()),
             )
             .child(
                 div()
                     .flex_shrink_0()
                     .text_xs()
                     .text_color(theme.muted)
-                    .child(format!(
-                        "{} · {} · {position} of {}",
-                        commit.author,
-                        commit.when,
-                        self.commits.len()
-                    )),
+                    .child(details),
             )
             .child(
                 self.symbol_button("previous-commit", Symbol::Previous, "Previous", theme)
@@ -1922,7 +2004,7 @@ impl DiffView {
             .selected_commit
             .as_ref()
             .filter(|_| self.tab == Tab::Commits)
-            .and_then(|sha| self.commits.iter().find(|commit| commit.sha == *sha));
+            .and_then(|key| self.revision(key));
         let placeholder = if !self.showing_diff() {
             Some(
                 if self.commit_load.is_some() || self.commits_load.is_some() {
@@ -2724,11 +2806,9 @@ impl DiffView {
         for (key, review) in self.reviews_in_order() {
             let prefix = match &key {
                 ViewKey::Files => String::new(),
-                ViewKey::Commit(sha) => self
-                    .commits
-                    .iter()
-                    .find(|commit| commit.sha == *sha)
-                    .map_or(String::new(), |commit| format!("{} ", commit.short)),
+                ViewKey::Revision(revision) => self
+                    .revision(revision)
+                    .map_or(String::new(), |revision| format!("{} ", revision.label())),
             };
             for entry in review.entries() {
                 let row = entry.row;
@@ -4577,6 +4657,10 @@ mod tests {
         let repo = feature_repo("commit-nav");
         let (view, cx) = repo.open(cx);
         click_selector("tab-commits", cx);
+        assert_eq!(source(&view, cx), "git diff + untracked files");
+        row_with_text(&view, "uncommitted", cx);
+
+        click_selector("previous-commit", cx);
         assert!(source(&view, cx).ends_with("(beta)"));
         row_with_text(&view, "beta", cx);
 
@@ -4599,6 +4683,7 @@ mod tests {
         comment_on(&view, "uncommitted", "on the diff", cx);
         cx.simulate_keystrokes("cmd-2");
         cx.run_until_parked();
+        click_selector("previous-commit", cx);
         comment_on(&view, "beta", "on a commit", cx);
         let commit_row = row_with_text(&view, "beta", cx);
 
@@ -4625,10 +4710,11 @@ mod tests {
         let repo = feature_repo("commit-summary");
         let (view, cx) = repo.open(cx);
         click_selector("tab-commits", cx);
+        click_selector("previous-commit", cx);
         comment_on(&view, "beta", "on a commit", cx);
         let (row, short) = view.read_with(cx, |view, _| {
             let row = *view.review.comments.keys().next().unwrap();
-            (row, view.commits[1].short.clone())
+            (row, view.commits[1].label().to_string())
         });
         click_selector("tab-files", cx);
         click_selector("finish-review", cx);
@@ -4643,13 +4729,22 @@ mod tests {
         let repo = feature_repo("commit-amend");
         let (view, cx) = repo.open(cx);
         click_selector("tab-commits", cx);
+        click_selector("previous-commit", cx);
         comment_on(&view, "beta", "still here", cx);
 
         repo.git(&["commit", "-q", "--amend", "-m", "beta reworded"]);
         cx.simulate_keystrokes("cmd-r");
         cx.run_until_parked();
 
-        let commits = view.read_with(cx, |view, _| view.commits.clone());
+        let commits: Vec<Commit> = view.read_with(cx, |view, _| {
+            view.commits
+                .iter()
+                .filter_map(|revision| match revision {
+                    Revision::Commit(commit) => Some(commit.clone()),
+                    Revision::Staged | Revision::Unstaged => None,
+                })
+                .collect()
+        });
         assert_eq!(commits.last().unwrap().subject, "beta reworded");
         let kept = commits
             .iter()
@@ -4666,7 +4761,7 @@ mod tests {
         let repo = feature_repo("commit-base");
         let (view, cx) = repo.open(cx);
         click_selector("tab-commits", cx);
-        assert_eq!(view.read_with(cx, |view, _| view.commits.len()), 2);
+        assert_eq!(view.read_with(cx, |view, _| view.commits.len()), 3);
 
         click_selector("change-base", cx);
         cx.simulate_input("HEAD~1");
@@ -4675,7 +4770,35 @@ mod tests {
 
         assert!(view.read_with(cx, |view, _| view.tab == Tab::Files));
         assert_eq!(source(&view, cx), "git diff HEAD~1");
-        assert_eq!(view.read_with(cx, |view, _| view.commits.len()), 1);
+        assert_eq!(view.read_with(cx, |view, _| view.commits.len()), 2);
+    }
+
+    #[gpui::test]
+    fn uncommitted_entries_follow_the_working_tree_on_refresh(cx: &mut TestAppContext) {
+        let repo = feature_repo("commit-uncommitted");
+        let (view, cx) = repo.open(cx);
+        click_selector("tab-commits", cx);
+        comment_on(&view, "uncommitted", "keep me", cx);
+
+        repo.write("one\nalpha\nbeta\nuncommitted\nmore\n");
+        cx.simulate_keystrokes("cmd-r");
+        cx.run_until_parked();
+        row_with_text(&view, "more", cx);
+        let row = row_with_text(&view, "uncommitted", cx);
+        assert_eq!(comment(&view, row, cx).as_deref(), Some("keep me"));
+
+        repo.git(&["add", "-A"]);
+        cx.simulate_keystrokes("cmd-r");
+        cx.run_until_parked();
+        let labels = view.read_with(cx, |view, _| {
+            view.commits
+                .iter()
+                .map(|revision| revision.label().to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(labels.last().map(String::as_str), Some("staged"));
+        assert_eq!(source(&view, cx), "git diff --cached");
+        assert_eq!(view.read_with(cx, |view, _| view.comment_count()), 0);
     }
 
     #[gpui::test]
@@ -4683,6 +4806,7 @@ mod tests {
         let repo = feature_repo("commit-draft");
         let (view, cx) = repo.open(cx);
         click_selector("tab-commits", cx);
+        click_selector("previous-commit", cx);
         let row = row_with_text(&view, "beta", cx);
         click_row(&view, row, cx);
         cx.simulate_input("half typed");
@@ -4775,7 +4899,7 @@ mod tests {
         click_selector("tab-commits", cx);
         cx.run_until_parked();
         let subjects = view.read_with(cx, |view, _| {
-            let subject = |commit: Option<&Commit>| commit.unwrap().subject.clone();
+            let subject = |revision: Option<&Revision>| revision.unwrap().subject().to_string();
             (subject(view.commits.first()), subject(view.commits.last()))
         });
         assert_eq!(subjects, ("change 0".to_string(), "change 39".to_string()));

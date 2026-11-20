@@ -32,6 +32,58 @@ pub struct Commit {
     pub in_range: bool,
 }
 
+/// An entry in the commit list.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Revision {
+    Commit(Commit),
+    Staged,
+    Unstaged,
+}
+
+/// Identifies a `Revision` across reloads of the commit list.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RevisionKey {
+    Commit(String),
+    Staged,
+    Unstaged,
+}
+
+impl Revision {
+    pub fn key(&self) -> RevisionKey {
+        match self {
+            Self::Commit(commit) => RevisionKey::Commit(commit.sha.clone()),
+            Self::Staged => RevisionKey::Staged,
+            Self::Unstaged => RevisionKey::Unstaged,
+        }
+    }
+
+    pub fn subject(&self) -> &str {
+        match self {
+            Self::Commit(commit) => &commit.subject,
+            Self::Staged => "Staged changes",
+            Self::Unstaged => "Unstaged changes",
+        }
+    }
+
+    /// A short tag: the abbreviated sha, or which uncommitted changes.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Commit(commit) => &commit.short,
+            Self::Staged => "staged",
+            Self::Unstaged => "unstaged",
+        }
+    }
+
+    /// Names this revision's diff in exported comments.
+    pub fn source(&self) -> String {
+        match self {
+            Self::Commit(commit) => format!("commit {} ({})", commit.short, commit.subject),
+            Self::Staged => "git diff --cached".to_string(),
+            Self::Unstaged => "git diff + untracked files".to_string(),
+        }
+    }
+}
+
 /// The git repository containing the current directory.
 #[derive(Clone)]
 pub struct Repo {
@@ -77,10 +129,21 @@ impl Repo {
             .unwrap_or_else(|| self.root.display().to_string())
     }
 
+    /// Commits under `args`, then whichever uncommitted changes the diff includes.
+    pub fn revisions(&self, args: &[String]) -> Result<Vec<Revision>, String> {
+        let mut revisions: Vec<Revision> = self
+            .commits(args)?
+            .into_iter()
+            .map(Revision::Commit)
+            .collect();
+        revisions.extend(self.uncommitted(args)?);
+        Ok(revisions)
+    }
+
     /// Commits being reviewed under `args`, or recent history if that range is empty.
-    pub fn commits(&self, args: &[String]) -> Result<Vec<Commit>, String> {
+    fn commits(&self, args: &[String]) -> Result<Vec<Commit>, String> {
         const RECENT: &str = "HEAD";
-        let revisions = Self::revisions(args);
+        let revisions = Self::revision_args(args);
         let range = match revisions.as_slice() {
             [] => self
                 .default_branch()
@@ -100,7 +163,44 @@ impl Repo {
         }
     }
 
-    fn revisions(args: &[String]) -> Vec<&str> {
+    /// Staged and unstaged changes, when non-empty and compared against by `args`.
+    fn uncommitted(&self, args: &[String]) -> Result<Vec<Revision>, String> {
+        let against_worktree = match Self::revision_args(args).as_slice() {
+            [] => true,
+            [base] => !base.contains(".."),
+            _ => false,
+        };
+        if !against_worktree {
+            return Ok(Vec::new());
+        }
+        let cached = args
+            .iter()
+            .any(|arg| arg == "--cached" || arg == "--staged");
+        let mut revisions = Vec::new();
+        if self.differs(&["--cached"])? {
+            revisions.push(Revision::Staged);
+        }
+        if !cached && (self.differs(&[])? || !self.untracked_files()?.is_empty()) {
+            revisions.push(Revision::Unstaged);
+        }
+        Ok(revisions)
+    }
+
+    fn differs(&self, args: &[&str]) -> Result<bool, String> {
+        let output = Command::new("git")
+            .current_dir(&self.root)
+            .args(["diff", "--quiet"])
+            .args(args)
+            .output()
+            .map_err(|err| format!("failed to run git: {err}"))?;
+        match output.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        }
+    }
+
+    fn revision_args(args: &[String]) -> Vec<&str> {
         args.iter()
             .take_while(|arg| *arg != "--")
             .filter(|arg| !arg.starts_with('-'))
@@ -135,8 +235,22 @@ impl Repo {
         })
     }
 
+    pub fn revision_patch(&self, key: &RevisionKey) -> Result<String, String> {
+        match key {
+            RevisionKey::Commit(sha) => self.commit_patch(sha),
+            RevisionKey::Staged => Self::run(
+                Self::diff_command().current_dir(&self.root).arg("--cached"),
+                &[0],
+            ),
+            RevisionKey::Unstaged => Ok(Self::run(
+                Self::diff_command().current_dir(&self.root),
+                &[0],
+            )? + &self.untracked_patch()?),
+        }
+    }
+
     /// Unified diff of one commit, against its first parent.
-    pub fn commit_patch(&self, sha: &str) -> Result<String, String> {
+    fn commit_patch(&self, sha: &str) -> Result<String, String> {
         Self::run(
             Command::new("git").current_dir(&self.root).args([
                 "-c",
@@ -238,7 +352,12 @@ impl Repo {
 
     fn uncommitted_patch(&self) -> Result<String, String> {
         let base = self.base_tree()?;
-        let mut patch = Self::run(Self::diff_command().current_dir(&self.root).arg(base), &[0])?;
+        let patch = Self::run(Self::diff_command().current_dir(&self.root).arg(base), &[0])?;
+        Ok(patch + &self.untracked_patch()?)
+    }
+
+    fn untracked_patch(&self) -> Result<String, String> {
+        let mut patch = String::new();
         for path in self.untracked_files()? {
             // `--no-index` exits 1 when the files differ.
             patch += &Self::run(
@@ -442,6 +561,39 @@ mod tests {
         let repo = TestRepo::new("recent");
         repo.commit("second");
         assert_eq!(repo.subjects(&[]), vec!["first", "second"]);
+    }
+
+    fn labels_of(repo: &TestRepo, args: &[&str]) -> Vec<String> {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        Repo::at(&repo.0)
+            .revisions(&args)
+            .unwrap()
+            .iter()
+            .map(|revision| revision.label().to_string())
+            .filter(|label| *label == "staged" || *label == "unstaged")
+            .collect()
+    }
+
+    #[test]
+    fn uncommitted_entries_appear_when_the_diff_includes_them() {
+        let repo = TestRepo::new("uncommitted");
+        assert!(labels_of(&repo, &[]).is_empty());
+
+        std::fs::write(repo.0.join("staged.txt"), "s\n").unwrap();
+        repo.git(&["add", "staged.txt"]);
+        assert_eq!(labels_of(&repo, &[]), vec!["staged"]);
+
+        std::fs::write(repo.0.join("untracked.txt"), "u\n").unwrap();
+        assert_eq!(labels_of(&repo, &[]), vec!["staged", "unstaged"]);
+        assert_eq!(labels_of(&repo, &["main"]), vec!["staged", "unstaged"]);
+        assert_eq!(labels_of(&repo, &["--cached"]), vec!["staged"]);
+        assert!(labels_of(&repo, &["main..HEAD"]).is_empty());
+
+        let root = Repo::at(&repo.0);
+        let staged = root.revision_patch(&RevisionKey::Staged).unwrap();
+        let unstaged = root.revision_patch(&RevisionKey::Unstaged).unwrap();
+        assert!(staged.contains("+s") && !staged.contains("+u"));
+        assert!(unstaged.contains("+u") && !unstaged.contains("+s"));
     }
 
     #[test]

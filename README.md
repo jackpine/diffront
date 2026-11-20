@@ -32,8 +32,9 @@ including file paths and hunk headers but not the bodies of collapsed files. `En
 `j` and `k` scroll the diff.
 
 The Files changed and Commits tabs (`⌘1`, `⌘2`) switch between the whole diff and one commit at a
-time; `⌘[` and `⌘]` step through commits. Comments stay with the view you left them in, and all of
-them are copied together.
+time; `⌘[` and `⌘]` step through commits. When the diff includes uncommitted work, Staged and
+Unstaged changes are listed after the commits. Comments stay with the view you left them in, and all
+of them are copied together.
 
 Click the diff name in the toolbar to change the base, or press `⌘R` to refresh. Comments follow
 their lines into the new diff. If a line is gone, diffront lists the affected comments and asks
