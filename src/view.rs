@@ -14,11 +14,11 @@ use crate::theme::{MONO_FONT, Theme};
 use crate::voice::{self, VoiceCommand};
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity,
-    FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, ListAlignment, ListOffset, ListState,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, Stateful, StyledText, Subscription, Task,
-    TextLayout, TouchPhase, Window, actions, canvas, combine_highlights, div, img, list,
-    prelude::*, px, relative,
+    FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
+    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, StyledText,
+    Subscription, Task, TextLayout, TouchPhase, Window, actions, canvas, combine_highlights, div,
+    img, list, prelude::*, px, relative,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -136,6 +136,14 @@ struct BasePanel {
     error: Option<SharedString>,
 }
 
+/// The file list's filter field, opened by typing while nothing else has focus.
+struct FileFilter {
+    input: Entity<TextArea>,
+    /// Lowercased, so matching ignores case.
+    query: String,
+    _changes: Subscription,
+}
+
 /// A loaded diff waiting for the user to accept losing some comments.
 struct PendingUpdate {
     args: Vec<String>,
@@ -176,6 +184,7 @@ pub struct DiffView {
     search: Search,
     search_input: Entity<TextArea>,
     _search_input_changes: Subscription,
+    file_filter: Option<FileFilter>,
     finish_panel: Option<Entity<TextArea>>,
     base_panel: Option<BasePanel>,
     pending_update: Option<PendingUpdate>,
@@ -239,6 +248,7 @@ impl DiffView {
             search: Search::default(),
             search_input,
             _search_input_changes: search_input_changes,
+            file_filter: None,
             finish_panel: None,
             base_panel: None,
             pending_update: None,
@@ -438,6 +448,87 @@ impl DiffView {
         self.search.open = true;
         self.focus_search(window, cx);
         self.run_search(cx);
+    }
+
+    /// Starts or extends the file filter with a character typed outside any text field.
+    fn type_into_file_filter(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let modifiers = keystroke.modifiers;
+        if !self.focus.is_focused(window)
+            || !self.showing_diff()
+            || modifiers.control
+            || modifiers.platform
+            || modifiers.function
+        {
+            return;
+        }
+        let Some(typed) = keystroke
+            .key_char
+            .as_deref()
+            .filter(|typed| !typed.trim().is_empty())
+        else {
+            return;
+        };
+        cx.stop_propagation();
+        if let Some(filter) = &self.file_filter {
+            let input = filter.input.clone();
+            input.update(cx, |input, cx| {
+                let text = format!("{}{typed}", input.text());
+                input.set_text(&text, cx);
+            });
+            window.focus(&input.focus_handle(cx));
+            return;
+        }
+        let input = cx.new(|cx| TextArea::new(typed.to_string(), "Filter files", cx));
+        let changes = cx.observe_in(&input, window, |this, input, window, cx| {
+            let query = input.read(cx).text().to_lowercase();
+            if query.is_empty() {
+                this.close_file_filter(window, cx);
+            } else if let Some(filter) = &mut this.file_filter {
+                filter.query = query;
+            }
+            cx.notify();
+        });
+        window.focus(&input.focus_handle(cx));
+        self.file_filter = Some(FileFilter {
+            input,
+            query: typed.to_lowercase(),
+            _changes: changes,
+        });
+        cx.notify();
+    }
+
+    fn close_file_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.file_filter = None;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// Jumps to the first file the filter shows and hands keys back to the diff.
+    fn open_first_filtered_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first = self.filtered_files().next();
+        if let Some(file) = first {
+            self.jump_to_file(file, cx);
+        }
+        window.focus(&self.focus);
+    }
+
+    fn filtered_files(&self) -> impl Iterator<Item = usize> + '_ {
+        let query = self.file_filter.as_ref().map(|filter| &filter.query);
+        self.review
+            .diff
+            .files
+            .iter()
+            .enumerate()
+            .filter(move |(_, file)| {
+                query.is_none_or(|query| file.path.to_lowercase().contains(query.as_str()))
+            })
+            .map(|(ix, _)| ix)
     }
 
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1230,8 +1321,9 @@ impl DiffView {
         let current = self.review_target();
         if current != self.shortcut_file
             && let Some(file) = current
+            && let Some(item) = self.filtered_files().position(|shown| shown == file)
         {
-            self.file_scroll.scroll_to_item(file);
+            self.file_scroll.scroll_to_item(item);
         }
         self.shortcut_file = current;
     }
@@ -1908,7 +2000,8 @@ impl DiffView {
     }
 
     fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.review.diff.files.iter().enumerate().map(|(ix, file)| {
+        let items = self.filtered_files().map(|ix| {
+            let file = &self.review.diff.files[ix];
             let (dir, name) = file
                 .path
                 .rsplit_once('/')
@@ -1984,6 +2077,17 @@ impl DiffView {
                         .flex_col()
                         .flex_1()
                         .min_h(px(0.))
+                        .children(self.render_file_filter(theme, cx))
+                        .when(items.is_empty() && self.file_filter.is_some(), |list| {
+                            list.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_sm()
+                                    .text_color(theme.muted)
+                                    .child("No matching files"),
+                            )
+                        })
                         .child(
                             div()
                                 .id("files")
@@ -2240,6 +2344,43 @@ impl DiffView {
             self.glide = Some(glide);
         }
         gliding
+    }
+
+    fn render_file_filter(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let filter = self.file_filter.as_ref()?;
+        Some(
+            div()
+                .key_context("FileFilter")
+                .on_action(cx.listener(|this, _: &SaveComment, window, cx| {
+                    this.open_first_filtered_file(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &CancelComment, window, cx| {
+                    this.close_file_filter(window, cx)
+                }))
+                .flex_shrink_0()
+                .px_3()
+                .py_1p5()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .debug_selector(|| "file-filter".to_string())
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.accent)
+                        .font_family(MONO_FONT)
+                        .text_xs()
+                        .line_height(px(20.))
+                        .child(filter.input.clone()),
+                ),
+        )
     }
 
     fn render_search_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3170,6 +3311,7 @@ impl Render for DiffView {
         div()
             .key_context("DiffView")
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::type_into_file_filter))
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.dismiss_selection(cx)))
             .on_action(cx.listener(Self::copy_comments))
             .on_action(cx.listener(Self::copy_selection))
@@ -3259,6 +3401,45 @@ mod tests {
 
     fn open(cx: &mut TestAppContext) -> (Entity<DiffView>, &mut VisualTestContext) {
         open_patch(PATCH.to_string(), cx)
+    }
+
+    fn filter_state(view: &Entity<DiffView>, cx: &mut VisualTestContext) -> Option<Vec<usize>> {
+        view.read_with(cx, |view, _| {
+            view.file_filter
+                .as_ref()
+                .map(|_| view.filtered_files().collect())
+        })
+    }
+
+    #[gpui::test]
+    fn typing_outside_a_text_field_filters_the_file_list(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        cx.simulate_keystrokes("j");
+        assert_eq!(filter_state(&view, cx), None);
+
+        cx.simulate_input("B.R");
+        assert_eq!(filter_state(&view, cx), Some(vec![1]));
+        cx.simulate_input("x");
+        assert_eq!(filter_state(&view, cx), Some(vec![]));
+
+        cx.simulate_keystrokes("backspace backspace backspace backspace");
+        assert_eq!(filter_state(&view, cx), None);
+        assert!(view.update_in(cx, |view, window, _| view.focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn escape_hides_the_file_filter_and_enter_jumps_to_the_first_match(cx: &mut TestAppContext) {
+        let (view, cx) = open_patch(long_patch(), cx);
+        cx.simulate_input("last");
+        cx.simulate_keystrokes("enter");
+        let current = view.read_with(cx, |view, _| view.current_file());
+        assert_eq!(current, Some(3));
+        assert_eq!(filter_state(&view, cx), Some(vec![3]));
+
+        cx.simulate_input("x");
+        assert_eq!(filter_state(&view, cx), Some(vec![]));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(filter_state(&view, cx), None);
     }
 
     fn long_patch() -> String {
