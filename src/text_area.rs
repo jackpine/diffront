@@ -15,7 +15,14 @@ actions!(
         Backspace,
         Delete,
         DeleteWordLeft,
+        DeleteWordRight,
+        DeleteToLineStart,
+        DeleteToLineEnd,
+        KillToLineEnd,
+        Yank,
+        Transpose,
         Newline,
+        OpenLine,
         Left,
         Right,
         Up,
@@ -24,6 +31,8 @@ actions!(
         WordRight,
         LineStart,
         LineEnd,
+        DocumentStart,
+        DocumentEnd,
         SelectLeft,
         SelectRight,
         SelectUp,
@@ -32,10 +41,14 @@ actions!(
         SelectWordRight,
         SelectLineStart,
         SelectLineEnd,
+        SelectDocumentStart,
+        SelectDocumentEnd,
         SelectAll,
         Copy,
         Cut,
         Paste,
+        Undo,
+        Redo,
     ]
 );
 
@@ -51,6 +64,15 @@ enum Motion {
     WordRight,
     LineStart,
     LineEnd,
+    DocumentStart,
+    DocumentEnd,
+}
+
+/// The text and selection to restore on undo or redo.
+struct Snapshot {
+    content: SharedString,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
 }
 
 /// A multi-line, soft-wrapping plain text input.
@@ -63,6 +85,11 @@ pub struct TextArea {
     marked_range: Option<Range<usize>>,
     layout: Option<TextLayout>,
     is_selecting: bool,
+    kill_buffer: String,
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
+    /// Where typing continues the previous undo step rather than starting a new one.
+    typing_end: Option<usize>,
 }
 
 impl TextArea {
@@ -77,6 +104,10 @@ impl TextArea {
             marked_range: None,
             layout: None,
             is_selecting: false,
+            kill_buffer: String::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            typing_end: None,
         }
     }
 
@@ -100,6 +131,7 @@ impl TextArea {
             KeyBinding::new("shift-backspace", Backspace, context),
             KeyBinding::new("delete", Delete, context),
             KeyBinding::new(&format!("{word}-backspace"), DeleteWordLeft, context),
+            KeyBinding::new(&format!("{word}-delete"), DeleteWordRight, context),
             KeyBinding::new("shift-enter", Newline, context),
             KeyBinding::new("left", Left, context),
             KeyBinding::new("right", Right, context),
@@ -121,6 +153,8 @@ impl TextArea {
             KeyBinding::new("secondary-c", Copy, context),
             KeyBinding::new("secondary-x", Cut, context),
             KeyBinding::new("secondary-v", Paste, context),
+            KeyBinding::new("secondary-z", Undo, context),
+            KeyBinding::new("secondary-shift-z", Redo, context),
         ]);
         #[cfg(target_os = "macos")]
         cx.bind_keys([
@@ -128,6 +162,42 @@ impl TextArea {
             KeyBinding::new("cmd-right", LineEnd, context),
             KeyBinding::new("cmd-shift-left", SelectLineStart, context),
             KeyBinding::new("cmd-shift-right", SelectLineEnd, context),
+            KeyBinding::new("cmd-up", DocumentStart, context),
+            KeyBinding::new("cmd-down", DocumentEnd, context),
+            KeyBinding::new("cmd-shift-up", SelectDocumentStart, context),
+            KeyBinding::new("cmd-shift-down", SelectDocumentEnd, context),
+            KeyBinding::new("alt-up", LineStart, context),
+            KeyBinding::new("alt-down", LineEnd, context),
+            KeyBinding::new("alt-shift-up", SelectLineStart, context),
+            KeyBinding::new("alt-shift-down", SelectLineEnd, context),
+            KeyBinding::new("cmd-backspace", DeleteToLineStart, context),
+            KeyBinding::new("cmd-delete", DeleteToLineEnd, context),
+            KeyBinding::new("ctrl-a", LineStart, context),
+            KeyBinding::new("ctrl-e", LineEnd, context),
+            KeyBinding::new("ctrl-b", Left, context),
+            KeyBinding::new("ctrl-f", Right, context),
+            KeyBinding::new("ctrl-p", Up, context),
+            KeyBinding::new("ctrl-n", Down, context),
+            KeyBinding::new("ctrl-shift-a", SelectLineStart, context),
+            KeyBinding::new("ctrl-shift-e", SelectLineEnd, context),
+            KeyBinding::new("ctrl-shift-b", SelectLeft, context),
+            KeyBinding::new("ctrl-shift-f", SelectRight, context),
+            KeyBinding::new("ctrl-shift-p", SelectUp, context),
+            KeyBinding::new("ctrl-shift-n", SelectDown, context),
+            KeyBinding::new("ctrl-h", Backspace, context),
+            KeyBinding::new("ctrl-d", Delete, context),
+            KeyBinding::new("ctrl-k", KillToLineEnd, context),
+            KeyBinding::new("ctrl-y", Yank, context),
+            KeyBinding::new("ctrl-t", Transpose, context),
+            KeyBinding::new("ctrl-o", OpenLine, context),
+        ]);
+        #[cfg(not(target_os = "macos"))]
+        cx.bind_keys([
+            KeyBinding::new("ctrl-home", DocumentStart, context),
+            KeyBinding::new("ctrl-end", DocumentEnd, context),
+            KeyBinding::new("ctrl-shift-home", SelectDocumentStart, context),
+            KeyBinding::new("ctrl-shift-end", SelectDocumentEnd, context),
+            KeyBinding::new("ctrl-y", Redo, context),
         ]);
     }
 
@@ -165,6 +235,8 @@ impl TextArea {
                 .map_or(self.content.len(), |ix| cursor + ix),
             Motion::Up => self.offset_on_adjacent_row(cursor, -1.),
             Motion::Down => self.offset_on_adjacent_row(cursor, 1.),
+            Motion::DocumentStart => 0,
+            Motion::DocumentEnd => self.content.len(),
         }
     }
 
@@ -239,6 +311,13 @@ impl TextArea {
     }
 
     fn replace(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        let continues_typing = range.is_empty() && self.typing_end == Some(range.start);
+        if !continues_typing {
+            self.undo_stack.push(self.snapshot());
+            self.redo_stack.clear();
+        }
+        self.typing_end = (!text.is_empty() && !text.ends_with(char::is_whitespace))
+            .then_some(range.start + text.len());
         self.content = format!(
             "{}{text}{}",
             &self.content[..range.start],
@@ -257,6 +336,82 @@ impl TextArea {
             self.select_to(offset, cx);
         }
         self.insert("", cx);
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        }
+    }
+
+    fn restore(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        self.content = snapshot.content;
+        self.selected_range = snapshot.selected_range;
+        self.selection_reversed = snapshot.selection_reversed;
+        self.marked_range = None;
+        self.typing_end = None;
+        cx.notify();
+    }
+
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            self.redo_stack.push(self.snapshot());
+            self.restore(snapshot, cx);
+        }
+    }
+
+    fn redo(&mut self, cx: &mut Context<Self>) {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            self.undo_stack.push(self.snapshot());
+            self.restore(snapshot, cx);
+        }
+    }
+
+    /// Deletes to the end of the line, or joins the next line when already there, saving what was
+    /// deleted for `yank`.
+    fn kill_to_line_end(&mut self, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let cursor = self.cursor_offset();
+            let line_end = self.offset_after(Motion::LineEnd);
+            let end = if line_end == cursor {
+                self.next_boundary(cursor)
+            } else {
+                line_end
+            };
+            self.select_to(end, cx);
+        }
+        self.kill_buffer = self.content[self.selected_range.clone()].to_string();
+        self.insert("", cx);
+    }
+
+    fn yank(&mut self, cx: &mut Context<Self>) {
+        let killed = self.kill_buffer.clone();
+        self.insert(&killed, cx);
+    }
+
+    /// Swaps the characters around the cursor, or the two before it at the end of a line.
+    fn transpose(&mut self, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            return;
+        }
+        let mut middle = self.cursor_offset();
+        if self.offset_after(Motion::LineEnd) == middle {
+            middle = self.previous_boundary(middle);
+        }
+        let start = self.previous_boundary(middle);
+        let end = self.next_boundary(middle);
+        if start == middle || middle == end {
+            return;
+        }
+        let swapped = format!("{}{}", &self.content[middle..end], &self.content[start..middle]);
+        self.replace(start..end, &swapped, cx);
+    }
+
+    fn open_line(&mut self, cx: &mut Context<Self>) {
+        self.insert("\n", cx);
+        self.move_to(self.cursor_offset() - 1, cx);
     }
 
     fn copy_selection(&self, cx: &mut Context<Self>) {
@@ -458,7 +613,34 @@ impl Render for TextArea {
             .on_action(cx.listener(|this, _: &DeleteWordLeft, _, cx| {
                 this.delete_to(this.offset_after(Motion::WordLeft), cx)
             }))
+            .on_action(cx.listener(|this, _: &DeleteWordRight, _, cx| {
+                this.delete_to(this.offset_after(Motion::WordRight), cx)
+            }))
+            .on_action(cx.listener(|this, _: &DeleteToLineStart, _, cx| {
+                this.delete_to(this.offset_after(Motion::LineStart), cx)
+            }))
+            .on_action(cx.listener(|this, _: &DeleteToLineEnd, _, cx| {
+                this.delete_to(this.offset_after(Motion::LineEnd), cx)
+            }))
+            .on_action(cx.listener(|this, _: &KillToLineEnd, _, cx| this.kill_to_line_end(cx)))
+            .on_action(cx.listener(|this, _: &Yank, _, cx| this.yank(cx)))
+            .on_action(cx.listener(|this, _: &Transpose, _, cx| this.transpose(cx)))
             .on_action(cx.listener(|this, _: &Newline, _, cx| this.insert("\n", cx)))
+            .on_action(cx.listener(|this, _: &OpenLine, _, cx| this.open_line(cx)))
+            .on_action(cx.listener(|this, _: &DocumentStart, _, cx| {
+                this.move_cursor(Motion::DocumentStart, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DocumentEnd, _, cx| {
+                this.move_cursor(Motion::DocumentEnd, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectDocumentStart, _, cx| {
+                this.select_with(Motion::DocumentStart, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectDocumentEnd, _, cx| {
+                this.select_with(Motion::DocumentEnd, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| this.undo(cx)))
+            .on_action(cx.listener(|this, _: &Redo, _, cx| this.redo(cx)))
             .on_action(cx.listener(|this, _: &Left, _, cx| this.move_cursor(Motion::Left, cx)))
             .on_action(cx.listener(|this, _: &Right, _, cx| this.move_cursor(Motion::Right, cx)))
             .on_action(cx.listener(|this, _: &Up, _, cx| this.move_cursor(Motion::Up, cx)))

@@ -3691,6 +3691,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn text_area_emacs_keys(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        click_row(&view, NEW_ROW, cx);
+
+        cx.simulate_input("one two");
+        cx.simulate_keystrokes("ctrl-a ctrl-d");
+        assert_eq!(draft_text(&view, cx), "ne two");
+
+        cx.simulate_keystrokes("ctrl-f ctrl-t");
+        assert_eq!(draft_text(&view, cx), "en two");
+
+        cx.simulate_keystrokes("ctrl-e ctrl-t");
+        assert_eq!(draft_text(&view, cx), "en tow");
+
+        cx.simulate_keystrokes("ctrl-a ctrl-f ctrl-f ctrl-k");
+        assert_eq!(draft_text(&view, cx), "en");
+        cx.simulate_keystrokes("ctrl-o ctrl-y");
+        assert_eq!(draft_text(&view, cx), "en tow\n");
+
+        cx.simulate_keystrokes("ctrl-k ctrl-a alt-delete");
+        assert_eq!(draft_text(&view, cx), " tow");
+
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(draft_text(&view, cx), "en tow");
+        cx.simulate_keystrokes("cmd-shift-z");
+        assert_eq!(draft_text(&view, cx), " tow");
+    }
+
+    #[gpui::test]
     fn sidebar_click_scrolls_to_the_file(cx: &mut TestAppContext) {
         let (view, cx) = open_patch(long_patch(), cx);
         let second_item = gpui::point(px(100.), px(40. + 4. + 30. + 15.));
