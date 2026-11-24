@@ -1,5 +1,8 @@
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use crate::diff::Diff;
 
 /// A diff the user can pick without typing its arguments.
 #[derive(Clone)]
@@ -235,7 +238,11 @@ impl Repo {
         })
     }
 
-    pub fn revision_patch(&self, key: &RevisionKey) -> Result<String, String> {
+    pub fn revision_diff(&self, key: &RevisionKey) -> Result<Diff, String> {
+        self.parse(&self.revision_patch(key)?)
+    }
+
+    fn revision_patch(&self, key: &RevisionKey) -> Result<String, String> {
         match key {
             RevisionKey::Commit(sha) => self.commit_patch(sha),
             RevisionKey::Staged => Self::run(
@@ -347,8 +354,72 @@ impl Repo {
         (!output.is_empty()).then(|| output.to_string())
     }
 
-    /// Unified diff for `git diff <args>`, or all uncommitted work when `args` is empty.
-    pub fn patch(&self, args: &[String]) -> Result<String, String> {
+    /// The diff for `git diff <args>`, or all uncommitted work when `args` is empty.
+    pub fn diff(&self, args: &[String]) -> Result<Diff, String> {
+        self.parse(&self.patch(args)?)
+    }
+
+    /// Parses `patch`, noting where files continue past their last hunk.
+    fn parse(&self, patch: &str) -> Result<Diff, String> {
+        let mut diff = Diff::parse(patch);
+        let (files, blobs): (Vec<usize>, Vec<&str>) = diff.tail_candidates().into_iter().unzip();
+        let old_lens = self.blob_line_counts(&blobs)?;
+        diff.add_tails(files.into_iter().zip(old_lens));
+        Ok(diff)
+    }
+
+    /// Counts each blob's lines in one `git cat-file`, the way a diff numbers them.
+    fn blob_line_counts(&self, blobs: &[&str]) -> Result<Vec<u32>, String> {
+        if blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let failed = |err: std::io::Error| format!("failed to run git: {err}");
+        let mut child = Command::new("git")
+            .current_dir(&self.root)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(failed)?;
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let request: String = blobs.iter().map(|blob| format!("{blob}\n")).collect();
+        // Written from another thread, so a full stdout pipe can't stall both sides.
+        let writer = std::thread::spawn(move || stdin.write_all(request.as_bytes()));
+        let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        let mut counts = Vec::with_capacity(blobs.len());
+        let mut header = String::new();
+        let mut content = Vec::new();
+        for _ in blobs {
+            header.clear();
+            stdout.read_line(&mut header).map_err(failed)?;
+            let Some(size) = header
+                .trim_end()
+                .rsplit_once(' ')
+                .and_then(|(_, size)| size.parse::<u64>().ok())
+            else {
+                counts.push(0);
+                continue;
+            };
+            content.clear();
+            (&mut stdout)
+                .take(size + 1)
+                .read_to_end(&mut content)
+                .map_err(failed)?;
+            content.pop();
+            let newlines = content.iter().filter(|byte| **byte == b'\n').count();
+            let unterminated = content.last().is_some_and(|byte| *byte != b'\n');
+            counts.push((newlines + usize::from(unterminated)) as u32);
+        }
+        writer
+            .join()
+            .expect("writer thread panicked")
+            .map_err(failed)?;
+        child.wait().map_err(failed)?;
+        Ok(counts)
+    }
+
+    fn patch(&self, args: &[String]) -> Result<String, String> {
         if args.is_empty() {
             self.uncommitted_patch()
         } else {
@@ -461,6 +532,7 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::Row;
 
     struct TestRepo(PathBuf);
 
@@ -606,6 +678,32 @@ mod tests {
         let unstaged = root.revision_patch(&RevisionKey::Unstaged).unwrap();
         assert!(staged.contains("+s") && !staged.contains("+u"));
         assert!(unstaged.contains("+u") && !unstaged.contains("+s"));
+    }
+
+    #[test]
+    fn diffs_end_with_a_tail_where_the_old_file_continues() {
+        let repo = TestRepo::new("tail");
+        let old: String = (1..=10).map(|n| format!("{n}\n")).collect();
+        std::fs::write(repo.0.join("long.txt"), &old).unwrap();
+        std::fs::write(repo.0.join("short.txt"), "a\nb").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.commit("files");
+        std::fs::write(repo.0.join("long.txt"), old.replacen("2\n", "two\n", 1)).unwrap();
+        std::fs::write(repo.0.join("short.txt"), "a\nc").unwrap();
+
+        let diff = Repo::at(&repo.0).diff(&["HEAD".to_string()]).unwrap();
+        let tails: Vec<&Row> = diff
+            .rows
+            .iter()
+            .filter(|row| matches!(row, Row::Tail { .. }))
+            .collect();
+        assert_eq!(
+            tails,
+            [&Row::Tail {
+                file: 0,
+                old_len: 10
+            }]
+        );
     }
 
     #[test]

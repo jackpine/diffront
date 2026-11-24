@@ -232,13 +232,24 @@ impl Hunk {
 pub enum Row {
     File(usize),
     Hunk(Hunk),
-    Line { file: usize, line: DiffLine },
+    Line {
+        file: usize,
+        line: DiffLine,
+    },
+    /// Below a file's last hunk, where the old file, `old_len` lines long, continues.
+    Tail {
+        file: usize,
+        old_len: u32,
+    },
 }
 
 impl Row {
     pub fn file(&self) -> usize {
         match self {
-            Row::File(file) | Row::Hunk(Hunk { file, .. }) | Row::Line { file, .. } => *file,
+            Row::File(file)
+            | Row::Hunk(Hunk { file, .. })
+            | Row::Line { file, .. }
+            | Row::Tail { file, .. } => *file,
         }
     }
 }
@@ -314,22 +325,38 @@ impl Diff {
             Row::File(file) => Cow::Borrowed(&self.files[*file].path),
             Row::Hunk(hunk) => Cow::Owned(hunk.header()),
             Row::Line { line, .. } => Cow::Owned(line.display_text()),
+            Row::Tail { .. } => Cow::Borrowed(""),
         }
     }
 
-    /// The old file's lines left out between the hunk at `row` and what precedes it in its file.
-    pub fn gap_above(&self, row: usize) -> Range<u32> {
-        let previous_end = self
-            .previous_hunk(row)
-            .map_or(1, |previous| self.hunk(previous).old.end);
-        previous_end..self.hunk(row).old.start
+    /// The old file's lines hidden at an expandable row: above a hunk, or below a file's last one.
+    pub fn gap(&self, row: usize) -> Range<u32> {
+        match &self.rows[row] {
+            Row::Hunk(hunk) => {
+                let previous_end = self
+                    .previous_hunk(row)
+                    .map_or(1, |previous| self.hunk(previous).old.end);
+                previous_end..hunk.old.start
+            }
+            Row::Tail { old_len, .. } => self.hunk(self.last_hunk(row)).old.end..old_len + 1,
+            other => unreachable!("{other:?} hides no lines"),
+        }
     }
 
     fn previous_hunk(&self, row: usize) -> Option<usize> {
-        let file_start = self.files[self.rows[row].file()].first_row;
-        (file_start..row)
+        self.hunk_before(self.rows[row].file(), row)
+    }
+
+    /// The last hunk header of `file` above `row`.
+    fn hunk_before(&self, file: usize, row: usize) -> Option<usize> {
+        (self.files[file].first_row..row)
             .rev()
             .find(|ix| matches!(self.rows[*ix], Row::Hunk(_)))
+    }
+
+    fn last_hunk(&self, tail: usize) -> usize {
+        self.previous_hunk(tail)
+            .expect("a tail only follows a file with hunks")
     }
 
     fn hunk(&self, row: usize) -> &Hunk {
@@ -346,29 +373,30 @@ impl Diff {
         hunk
     }
 
-    /// Shows up to `limit` of the old file's lines hidden above the hunk at `row`, merging it into
-    /// the hunk before once none are left. Returns how many rows replace the header.
-    pub fn expand_above(&mut self, row: usize, old_lines: &[String], limit: u32) -> usize {
+    /// Shows up to `limit` hidden lines at an expandable row, from `old_lines` (the old file).
+    /// Returns how many rows replace it.
+    pub fn expand(&mut self, row: usize, old_lines: &[String], limit: u32) -> usize {
+        let file = self.rows[row].file();
+        let replacement = match self.rows[row] {
+            Row::Tail { .. } => self.expand_tail(row, old_lines, limit),
+            _ => self.expand_above(row, old_lines, limit),
+        };
+        for later in &mut self.files[file + 1..] {
+            later.first_row = later.first_row + replacement - 1;
+        }
+        replacement
+    }
+
+    /// Reveals lines above a hunk, merging it into the hunk before once none are left.
+    fn expand_above(&mut self, row: usize, old_lines: &[String], limit: u32) -> usize {
         let previous = self.previous_hunk(row);
-        let gap = self.gap_above(row);
+        let gap = self.gap(row);
         let revealed = gap.end.saturating_sub(limit).max(gap.start)..gap.end;
         let hunk = self.hunk_mut(row);
         hunk.old.start = revealed.start;
         hunk.new.start -= revealed.len() as u32;
-        let file = hunk.file;
+        let lines = Self::context_rows(hunk.file, revealed.clone(), hunk.new.start, old_lines);
         let (old_end, new_end) = (hunk.old.end, hunk.new.end);
-        let lines: Vec<Row> = revealed
-            .clone()
-            .zip(hunk.new.start..)
-            .map(|(old, new)| Row::Line {
-                file,
-                line: DiffLine {
-                    kind: LineKind::Context { old, new },
-                    text: old_lines[old as usize - 1].clone(),
-                    emphasis: Vec::new(),
-                },
-            })
-            .collect();
         let keeps_header = revealed.start > gap.start;
         if !keeps_header && let Some(previous) = previous {
             let previous = self.hunk_mut(previous);
@@ -378,10 +406,70 @@ impl Diff {
         let replacement = usize::from(keeps_header) + lines.len();
         self.rows
             .splice(row + usize::from(keeps_header)..row + 1, lines);
-        for later in &mut self.files[file + 1..] {
-            later.first_row = later.first_row + replacement - 1;
-        }
         replacement
+    }
+
+    /// Reveals lines after a file's last hunk, extending it, until the file's end.
+    fn expand_tail(&mut self, row: usize, old_lines: &[String], limit: u32) -> usize {
+        let gap = self.gap(row);
+        let revealed = gap.start..gap.end.min(gap.start.saturating_add(limit));
+        let last = self.last_hunk(row);
+        let hunk = self.hunk_mut(last);
+        let lines = Self::context_rows(hunk.file, revealed.clone(), hunk.new.end, old_lines);
+        hunk.old.end = revealed.end;
+        hunk.new.end += revealed.len() as u32;
+        let keeps_tail = revealed.end < gap.end;
+        let replacement = lines.len() + usize::from(keeps_tail);
+        self.rows.splice(row..row + usize::from(!keeps_tail), lines);
+        replacement
+    }
+
+    fn context_rows(
+        file: usize,
+        old: Range<u32>,
+        new_start: u32,
+        old_lines: &[String],
+    ) -> Vec<Row> {
+        old.zip(new_start..)
+            .map(|(old, new)| Row::Line {
+                file,
+                line: DiffLine {
+                    kind: LineKind::Context { old, new },
+                    text: old_lines[old as usize - 1].clone(),
+                    emphasis: Vec::new(),
+                },
+            })
+            .collect()
+    }
+
+    /// Text files with hunks, and their old blob, whose remaining lines could be shown.
+    pub fn tail_candidates(&self) -> Vec<(usize, &str)> {
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(file, _)| self.hunk_before(*file, self.file_body(*file).end).is_some())
+            .filter_map(|(file, header)| Some((file, header.old_blob.as_deref()?)))
+            .collect()
+    }
+
+    /// Adds an expander after each file's last hunk where the old file, `old_len` lines long,
+    /// continues past it.
+    pub fn add_tails(&mut self, old_lens: impl IntoIterator<Item = (usize, u32)>) {
+        let mut old_lens: Vec<_> = old_lens.into_iter().collect();
+        old_lens.sort_unstable_by_key(|(file, _)| std::cmp::Reverse(*file));
+        for (file, old_len) in old_lens {
+            let end = self.file_body(file).end;
+            let Some(last) = self.hunk_before(file, end) else {
+                continue;
+            };
+            if self.hunk(last).old.end > old_len {
+                continue;
+            }
+            self.rows.insert(end, Row::Tail { file, old_len });
+            for later in &mut self.files[file + 1..] {
+                later.first_row += 1;
+            }
+        }
     }
 
     pub fn parse(patch: &str) -> Self {
@@ -794,16 +882,16 @@ mod tests {
         let added = Diff::parse("diff --git a/n b/n\nindex 0000000..1234567\n@@ -0,0 +1 @@\n+x\n");
         assert_eq!(added.files[0].old_blob, None);
         assert_eq!(headers(&added), ["@@ -0,0 +1 @@"]);
-        assert!(added.gap_above(1).is_empty());
+        assert!(added.gap(1).is_empty());
     }
 
     #[test]
     fn expanding_reveals_lines_above_then_merges_with_the_hunk_before() {
         let mut diff = Diff::parse(GAPPY);
         let second = 5;
-        assert_eq!(diff.gap_above(second), 13..25);
+        assert_eq!(diff.gap(second), 13..25);
 
-        assert_eq!(diff.expand_above(second, &old_file(), 5), 6);
+        assert_eq!(diff.expand(second, &old_file(), 5), 6);
         assert_eq!(headers(&diff)[1], "@@ -20,7 +19,7 @@ fn second()");
         assert_eq!(
             lines(&diff)[3..5],
@@ -813,7 +901,7 @@ mod tests {
             ]
         );
 
-        assert_eq!(diff.expand_above(second, &old_file(), 20), 7);
+        assert_eq!(diff.expand(second, &old_file(), 20), 7);
         assert_eq!(headers(&diff), ["@@ -10,17 +10,16 @@ fn first()"]);
         assert_eq!(
             lines(&diff)[3],
@@ -824,8 +912,8 @@ mod tests {
     #[test]
     fn expanding_the_first_hunk_to_the_top_drops_its_header() {
         let mut diff = Diff::parse(GAPPY);
-        assert_eq!(diff.gap_above(1), 1..10);
-        assert_eq!(diff.expand_above(1, &old_file(), u32::MAX), 9);
+        assert_eq!(diff.gap(1), 1..10);
+        assert_eq!(diff.expand(1, &old_file(), u32::MAX), 9);
         assert_eq!(headers(&diff), ["@@ -25,2 +24,2 @@ fn second()"]);
         assert_eq!(
             lines(&diff)[0],
@@ -837,9 +925,51 @@ mod tests {
     fn expanding_shifts_later_files() {
         let mut diff = Diff::parse(&format!("{GAPPY}diff --git a/b b/b\n"));
         let before = diff.files[1].first_row;
-        diff.expand_above(1, &old_file(), 3);
+        diff.expand(1, &old_file(), 3);
         assert_eq!(diff.files[1].first_row, before + 3);
         assert_eq!(diff.rows[diff.files[1].first_row], Row::File(1));
+    }
+
+    #[test]
+    fn tails_appear_only_where_the_old_file_continues() {
+        let mut diff = Diff::parse(&format!(
+            "{GAPPY}diff --git a/b b/b\nindex 1234567..89abcde 100644\n@@ -1 +1 @@\n-x\n+y\n"
+        ));
+        assert_eq!(diff.tail_candidates(), [(0, "1234567"), (1, "1234567")]);
+        diff.add_tails([(0, 30), (1, 1)]);
+        let tail = diff.file_body(0).end - 1;
+        assert_eq!(
+            diff.rows[tail],
+            Row::Tail {
+                file: 0,
+                old_len: 30
+            }
+        );
+        assert_eq!(diff.gap(tail), 27..31);
+        assert_eq!(diff.rows[diff.files[1].first_row], Row::File(1));
+        assert!(!diff.rows.contains(&Row::Tail {
+            file: 1,
+            old_len: 1
+        }));
+    }
+
+    #[test]
+    fn expanding_a_tail_extends_the_last_hunk_until_the_file_ends() {
+        let mut diff = Diff::parse(GAPPY);
+        diff.add_tails([(0, 30)]);
+        let tail = diff.rows.len() - 1;
+
+        assert_eq!(diff.expand(tail, &old_file(), 3), 4);
+        assert_eq!(headers(&diff)[1], "@@ -25,5 +24,5 @@ fn second()");
+        assert_eq!(
+            lines(&diff).last(),
+            Some(&(LineKind::Context { old: 29, new: 28 }, "line 29"))
+        );
+        assert_eq!(diff.gap(diff.rows.len() - 1), 30..31);
+
+        assert_eq!(diff.expand(diff.rows.len() - 1, &old_file(), 3), 1);
+        assert!(!diff.rows.iter().any(|row| matches!(row, Row::Tail { .. })));
+        assert_eq!(headers(&diff)[1], "@@ -25,6 +24,6 @@ fn second()");
     }
 
     #[test]

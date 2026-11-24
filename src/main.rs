@@ -14,7 +14,6 @@ mod view;
 #[cfg(target_os = "macos")]
 mod voice;
 
-use diff::Diff;
 use git::Repo;
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions,
@@ -102,7 +101,7 @@ fn main() {
 
 fn load_review(args: &[String]) -> Result<(Repo, Review), String> {
     let repo = Repo::discover()?;
-    let diff = Diff::parse(&repo.patch(args)?);
+    let diff = repo.diff(args)?;
     Ok((repo, Review::new(Repo::describe(args), diff)))
 }
 

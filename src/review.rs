@@ -77,10 +77,10 @@ impl Review {
         }
     }
 
-    /// Reveals hidden lines above the hunk at `row`, keeping comments on their lines. Returns how
-    /// many rows replace the header.
-    pub fn expand_hunk(&mut self, row: usize, old_lines: &[String], limit: u32) -> usize {
-        let replacement = self.diff.expand_above(row, old_lines, limit);
+    /// Reveals hidden lines at an expandable row, keeping comments on their lines. Returns how many
+    /// rows replace it.
+    pub fn expand(&mut self, row: usize, old_lines: &[String], limit: u32) -> usize {
+        let replacement = self.diff.expand(row, old_lines, limit);
         self.comments = std::mem::take(&mut self.comments)
             .into_iter()
             .map(|(commented, text)| {

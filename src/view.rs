@@ -858,7 +858,7 @@ impl DiffView {
         let repo = self.repo.clone();
         let patch = {
             let key = key.clone();
-            cx.background_spawn(async move { repo.revision_patch(&key) })
+            cx.background_spawn(async move { repo.revision_diff(&key) })
         };
         self.commit_load = Some(cx.spawn_in(window, async move |this, cx| {
             let patch = patch.await;
@@ -874,7 +874,7 @@ impl DiffView {
     fn finish_commit_load(
         &mut self,
         key: RevisionKey,
-        patch: Result<String, String>,
+        patch: Result<Diff, String>,
         cx: &mut Context<Self>,
     ) {
         let patch = match patch {
@@ -891,7 +891,7 @@ impl DiffView {
         self.parked.insert(
             key.clone(),
             Parked {
-                review: Review::new(source, Diff::parse(&patch)),
+                review: Review::new(source, patch),
                 top: ListOffset {
                     item_ix: 0,
                     offset_in_item: px(0.),
@@ -929,7 +929,7 @@ impl DiffView {
             let patches: Vec<_> = loaded
                 .into_iter()
                 .map(|key| {
-                    let patch = repo.revision_patch(&key);
+                    let patch = repo.revision_diff(&key);
                     (key, patch)
                 })
                 .collect();
@@ -949,7 +949,7 @@ impl DiffView {
     fn finish_commits(
         &mut self,
         revisions: Vec<Revision>,
-        uncommitted_patches: Vec<(RevisionKey, Result<String, String>)>,
+        uncommitted_patches: Vec<(RevisionKey, Result<Diff, String>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -994,7 +994,7 @@ impl DiffView {
     fn refresh_uncommitted(
         &mut self,
         key: RevisionKey,
-        patch: Result<String, String>,
+        patch: Result<Diff, String>,
         cx: &mut Context<Self>,
     ) -> usize {
         let view_key = ViewKey::Revision(key.clone());
@@ -1009,7 +1009,7 @@ impl DiffView {
             self.parked.remove(&view_key);
             return lost;
         };
-        let diff = Diff::parse(&patch);
+        let diff = patch;
         let is_active = self.active == view_key;
         let review = if is_active {
             &mut self.review
@@ -1488,15 +1488,15 @@ impl DiffView {
         cx.notify();
     }
 
-    /// Reveals the lines hidden above a hunk, a step at a time or all at once.
-    fn expand_hunk(&mut self, row: usize, old_blob: &str, all: bool, cx: &mut Context<Self>) {
+    /// Reveals the lines hidden at a hunk header or file tail, a step at a time or all at once.
+    fn expand(&mut self, row: usize, old_blob: &str, all: bool, cx: &mut Context<Self>) {
         let old_lines = match self.repo.blob_lines(old_blob) {
             Ok(lines) => lines,
             Err(err) => return self.show_status(format!("Couldn't read the file: {err}"), cx),
         };
         let header = self.display.item_of(row);
         let limit = if all { u32::MAX } else { EXPAND_STEP };
-        let replacement = self.review.expand_hunk(row, &old_lines, limit);
+        let replacement = self.review.expand(row, &old_lines, limit);
         if let Some(draft) = self.draft.as_mut().filter(|draft| draft.row > row) {
             draft.row = draft.row + replacement - 1;
         }
@@ -1604,7 +1604,7 @@ impl DiffView {
         let repo = self.repo.clone();
         let patch = {
             let args = args.clone();
-            cx.background_spawn(async move { repo.patch(&args) })
+            cx.background_spawn(async move { repo.diff(&args) })
         };
         self.loading = Some(cx.spawn_in(window, async move |this, cx| {
             let patch = patch.await;
@@ -1620,7 +1620,7 @@ impl DiffView {
     fn finish_load(
         &mut self,
         args: Vec<String>,
-        patch: Result<String, String>,
+        patch: Result<Diff, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1637,7 +1637,7 @@ impl DiffView {
             }
         };
         self.show_tab(Tab::Files, window, cx);
-        let diff = Diff::parse(&patch);
+        let diff = patch;
         if args == self.args && diff == self.review.diff {
             self.close_base_panel(window, cx);
             self.show_status("Already up to date".to_string(), cx);
@@ -2600,33 +2600,56 @@ impl DiffView {
                 .child(self.render_file_header(*file, &theme, cx))
                 .into_any_element(),
             Row::Hunk(hunk) => {
-                let expandable_blob = self.review.diff.files[hunk.file]
-                    .old_blob
-                    .clone()
-                    .filter(|_| !self.review.diff.gap_above(ix).is_empty());
-                let hover = theme.hunk_bg.blend(theme.hover);
-                row.id(("hunk", ix))
-                    .px_3()
-                    .py_0p5()
-                    .bg(theme.hunk_bg)
-                    .text_color(theme.muted)
-                    .font_family(MONO_FONT)
-                    .text_xs()
-                    .child(self.highlighted_text(ix, hunk.header(), None, Vec::new(), &theme))
-                    .when_some(expandable_blob, |row, blob| {
-                        row.debug_selector(move || format!("hunk-{ix}"))
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(hover))
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                this.expand_hunk(ix, &blob, event.modifiers().shift, cx)
-                            }))
-                    })
+                let header = self.highlighted_text(ix, hunk.header(), None, Vec::new(), &theme);
+                row.child(self.render_expander(ix, header, &theme, cx))
+                    .into_any_element()
+            }
+            Row::Tail { .. } => {
+                let hidden = self.review.diff.gap(ix).len();
+                let label = match hidden {
+                    1 => "1 more line".to_string(),
+                    count => format!("{count} more lines"),
+                };
+                row.child(self.render_expander(ix, label, &theme, cx))
                     .into_any_element()
             }
             Row::Line { line, .. } => row
                 .child(self.render_inline_line(ix, line, &theme, cx))
                 .into_any_element(),
         }
+    }
+
+    /// A hunk-colored bar that reveals the old file's hidden lines when clicked.
+    fn render_expander(
+        &self,
+        ix: usize,
+        content: impl IntoElement,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let blob = self.review.diff.files[self.review.diff.rows[ix].file()]
+            .old_blob
+            .clone()
+            .filter(|_| !self.review.diff.gap(ix).is_empty());
+        let hover = theme.hunk_bg.blend(theme.hover);
+        div()
+            .id(("expander", ix))
+            .px_3()
+            .py_0p5()
+            .bg(theme.hunk_bg)
+            .text_color(theme.muted)
+            .font_family(MONO_FONT)
+            .text_xs()
+            .child(content)
+            .when_some(blob, |expander, blob| {
+                expander
+                    .debug_selector(move || format!("expander-{ix}"))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        this.expand(ix, &blob, event.modifiers().shift, cx)
+                    }))
+            })
     }
 
     fn render_chevron(&self, collapsed: bool, theme: &Theme) -> impl IntoElement {
@@ -3614,7 +3637,7 @@ mod tests {
         let commented = 3;
         view.update(cx, |view, _| view.review.set_comment(commented, "keep me"));
 
-        click_selector("hunk-1", cx);
+        click_selector("expander-1", cx);
         cx.run_until_parked();
         let (header, first_shown, comments) = view.read_with(cx, |view, _| {
             (
@@ -4761,7 +4784,7 @@ mod tests {
                 DiffView::bind_keys(cx);
             });
             let repo = Repo::at(&self.path);
-            let diff = Diff::parse(&repo.patch(&[]).unwrap());
+            let diff = repo.diff(&[]).unwrap();
             let review = Review::new(Repo::describe(&[]), diff);
             let (view, cx) = cx
                 .add_window_view(|window, cx| DiffView::new(review, repo, Vec::new(), window, cx));
