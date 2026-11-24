@@ -77,6 +77,24 @@ impl Review {
         }
     }
 
+    /// Reveals hidden lines above the hunk at `row`, keeping comments on their lines. Returns how
+    /// many rows replace the header.
+    pub fn expand_hunk(&mut self, row: usize, old_lines: &[String], limit: u32) -> usize {
+        let replacement = self.diff.expand_above(row, old_lines, limit);
+        self.comments = std::mem::take(&mut self.comments)
+            .into_iter()
+            .map(|(commented, text)| {
+                let shifted = if commented > row {
+                    commented + replacement - 1
+                } else {
+                    commented
+                };
+                (shifted, text)
+            })
+            .collect();
+        replacement
+    }
+
     pub fn comments_in_file(&self, file: usize) -> usize {
         self.comments
             .keys()
@@ -251,11 +269,14 @@ impl Review {
         usize::from(same_before) + usize::from(same_after)
     }
 
+    /// The file's changed lines; context is left out, since how much is shown can vary.
     fn lines_of(diff: &Diff, file: usize) -> impl Iterator<Item = &DiffLine> {
         diff.rows[diff.file_body(file)]
             .iter()
             .filter_map(|row| match row {
-                Row::Line { line, .. } => Some(line),
+                Row::Line { line, .. } if !matches!(line.kind, LineKind::Context { .. }) => {
+                    Some(line)
+                }
                 _ => None,
             })
     }

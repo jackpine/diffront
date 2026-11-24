@@ -27,6 +27,8 @@ pub struct FileHeader {
     pub added: usize,
     pub removed: usize,
     pub first_row: usize,
+    /// The pre-image's blob, which hidden context lines are read from.
+    pub old_blob: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -170,18 +172,73 @@ impl DiffLine {
     }
 }
 
+/// A hunk header, with the lines it spans on each side.
+#[derive(Debug, PartialEq)]
+pub struct Hunk {
+    pub file: usize,
+    pub old: Range<u32>,
+    pub new: Range<u32>,
+    /// What git names after the ranges, such as the enclosing function.
+    section: String,
+}
+
+impl Hunk {
+    fn parse(file: usize, header: &str) -> Option<Self> {
+        let ranges = header.strip_prefix("@@ -")?;
+        let (old, ranges) = ranges.split_once(" +")?;
+        let (new, section) = ranges.split_once(" @@")?;
+        Some(Self {
+            file,
+            old: Self::parse_range(old)?,
+            new: Self::parse_range(new)?,
+            section: section.to_string(),
+        })
+    }
+
+    /// Reads `start[,count]`, where an empty range's start is the line before it.
+    fn parse_range(range: &str) -> Option<Range<u32>> {
+        let (start, count) = match range.split_once(',') {
+            Some((start, count)) => (start.parse().ok()?, count.parse().ok()?),
+            None => (range.parse().ok()?, 1),
+        };
+        let start = if count == 0 { start + 1 } else { start };
+        Some(start..start + count)
+    }
+
+    fn format_range(range: &Range<u32>) -> String {
+        let start = if range.is_empty() {
+            range.start - 1
+        } else {
+            range.start
+        };
+        match range.len() {
+            1 => start.to_string(),
+            count => format!("{start},{count}"),
+        }
+    }
+
+    pub fn header(&self) -> String {
+        format!(
+            "@@ -{} +{} @@{}",
+            Self::format_range(&self.old),
+            Self::format_range(&self.new),
+            self.section
+        )
+    }
+}
+
 /// One entry in the flattened, scrollable diff.
 #[derive(Debug, PartialEq)]
 pub enum Row {
     File(usize),
-    Hunk { file: usize, header: String },
+    Hunk(Hunk),
     Line { file: usize, line: DiffLine },
 }
 
 impl Row {
     pub fn file(&self) -> usize {
         match self {
-            Row::File(file) | Row::Hunk { file, .. } | Row::Line { file, .. } => *file,
+            Row::File(file) | Row::Hunk(Hunk { file, .. }) | Row::Line { file, .. } => *file,
         }
     }
 }
@@ -202,24 +259,12 @@ struct HunkCursor {
 }
 
 impl HunkCursor {
-    fn parse(header: &str) -> Option<Self> {
-        let ranges = header.strip_prefix("@@ -")?;
-        let (old, ranges) = ranges.split_once(" +")?;
-        let (new, _) = ranges.split_once(" @@")?;
-        let (old, old_remaining) = Self::parse_range(old)?;
-        let (new, new_remaining) = Self::parse_range(new)?;
-        Some(Self {
-            old,
-            new,
-            old_remaining,
-            new_remaining,
-        })
-    }
-
-    fn parse_range(range: &str) -> Option<(u32, u32)> {
-        match range.split_once(',') {
-            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
-            None => Some((range.parse().ok()?, 1)),
+    fn new(hunk: &Hunk) -> Self {
+        Self {
+            old: hunk.old.start,
+            new: hunk.new.start,
+            old_remaining: hunk.old.len() as u32,
+            new_remaining: hunk.new.len() as u32,
         }
     }
 
@@ -267,9 +312,76 @@ impl Diff {
     pub fn row_text(&self, row: usize) -> Cow<'_, str> {
         match &self.rows[row] {
             Row::File(file) => Cow::Borrowed(&self.files[*file].path),
-            Row::Hunk { header, .. } => Cow::Borrowed(header),
+            Row::Hunk(hunk) => Cow::Owned(hunk.header()),
             Row::Line { line, .. } => Cow::Owned(line.display_text()),
         }
+    }
+
+    /// The old file's lines left out between the hunk at `row` and what precedes it in its file.
+    pub fn gap_above(&self, row: usize) -> Range<u32> {
+        let previous_end = self
+            .previous_hunk(row)
+            .map_or(1, |previous| self.hunk(previous).old.end);
+        previous_end..self.hunk(row).old.start
+    }
+
+    fn previous_hunk(&self, row: usize) -> Option<usize> {
+        let file_start = self.files[self.rows[row].file()].first_row;
+        (file_start..row)
+            .rev()
+            .find(|ix| matches!(self.rows[*ix], Row::Hunk(_)))
+    }
+
+    fn hunk(&self, row: usize) -> &Hunk {
+        let Row::Hunk(hunk) = &self.rows[row] else {
+            unreachable!("row {row} is not a hunk header");
+        };
+        hunk
+    }
+
+    fn hunk_mut(&mut self, row: usize) -> &mut Hunk {
+        let Row::Hunk(hunk) = &mut self.rows[row] else {
+            unreachable!("row {row} is not a hunk header");
+        };
+        hunk
+    }
+
+    /// Shows up to `limit` of the old file's lines hidden above the hunk at `row`, merging it into
+    /// the hunk before once none are left. Returns how many rows replace the header.
+    pub fn expand_above(&mut self, row: usize, old_lines: &[String], limit: u32) -> usize {
+        let previous = self.previous_hunk(row);
+        let gap = self.gap_above(row);
+        let revealed = gap.end.saturating_sub(limit).max(gap.start)..gap.end;
+        let hunk = self.hunk_mut(row);
+        hunk.old.start = revealed.start;
+        hunk.new.start -= revealed.len() as u32;
+        let file = hunk.file;
+        let (old_end, new_end) = (hunk.old.end, hunk.new.end);
+        let lines: Vec<Row> = revealed
+            .clone()
+            .zip(hunk.new.start..)
+            .map(|(old, new)| Row::Line {
+                file,
+                line: DiffLine {
+                    kind: LineKind::Context { old, new },
+                    text: old_lines[old as usize - 1].clone(),
+                    emphasis: Vec::new(),
+                },
+            })
+            .collect();
+        let keeps_header = revealed.start > gap.start;
+        if !keeps_header && let Some(previous) = previous {
+            let previous = self.hunk_mut(previous);
+            previous.old.end = old_end;
+            previous.new.end = new_end;
+        }
+        let replacement = usize::from(keeps_header) + lines.len();
+        self.rows
+            .splice(row + usize::from(keeps_header)..row + 1, lines);
+        for later in &mut self.files[file + 1..] {
+            later.first_row = later.first_row + replacement - 1;
+        }
+        replacement
     }
 
     pub fn parse(patch: &str) -> Self {
@@ -335,6 +447,7 @@ impl Diff {
             added: 0,
             removed: 0,
             first_row: self.rows.len() - 1,
+            old_blob: None,
         });
     }
 
@@ -363,14 +476,17 @@ impl Diff {
             if let Some(path) = path.strip_prefix("b/") {
                 file.path = path.to_string();
             }
+        } else if let Some(blobs) = text.strip_prefix("index ") {
+            file.old_blob = blobs
+                .split_once("..")
+                .map(|(old, _)| old.to_string())
+                .filter(|old| old.bytes().any(|byte| byte != b'0'));
         } else if text.starts_with("Binary files ") || text == "GIT binary patch" {
             file.content = Content::Binary;
         } else if text.starts_with("@@ ") {
-            let cursor = HunkCursor::parse(text)?;
-            self.rows.push(Row::Hunk {
-                file: file_ix,
-                header: text.to_string(),
-            });
+            let hunk = Hunk::parse(file_ix, text)?;
+            let cursor = HunkCursor::new(&hunk);
+            self.rows.push(Row::Hunk(hunk));
             return Some(cursor);
         }
         None
@@ -637,6 +753,93 @@ mod tests {
                 vec![],
             ]
         );
+    }
+
+    /// Two hunks of a 30-line file, hiding lines 1-9 and 13-24 (22-23 as new lines 21-22).
+    const GAPPY: &str = "diff --git a/a b/a\n\
+                         index 1234567..89abcde 100644\n\
+                         --- a/a\n\
+                         +++ b/a\n\
+                         @@ -10,3 +10,2 @@ fn first()\n\
+                         \x20line 10\n\
+                         -line 11\n\
+                         \x20line 12\n\
+                         @@ -25,2 +24,2 @@ fn second()\n\
+                         -line 25\n\
+                         +changed 25\n\
+                         \x20line 26\n";
+
+    fn old_file() -> Vec<String> {
+        (1..=30).map(|n| format!("line {n}")).collect()
+    }
+
+    fn headers(diff: &Diff) -> Vec<String> {
+        (0..diff.rows.len())
+            .filter(|row| matches!(diff.rows[*row], Row::Hunk(_)))
+            .map(|row| diff.row_text(row).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn reads_the_old_blob_and_rebuilds_headers() {
+        let diff = Diff::parse(GAPPY);
+        assert_eq!(diff.files[0].old_blob.as_deref(), Some("1234567"));
+        assert_eq!(
+            headers(&diff),
+            [
+                "@@ -10,3 +10,2 @@ fn first()",
+                "@@ -25,2 +24,2 @@ fn second()"
+            ]
+        );
+        let added = Diff::parse("diff --git a/n b/n\nindex 0000000..1234567\n@@ -0,0 +1 @@\n+x\n");
+        assert_eq!(added.files[0].old_blob, None);
+        assert_eq!(headers(&added), ["@@ -0,0 +1 @@"]);
+        assert!(added.gap_above(1).is_empty());
+    }
+
+    #[test]
+    fn expanding_reveals_lines_above_then_merges_with_the_hunk_before() {
+        let mut diff = Diff::parse(GAPPY);
+        let second = 5;
+        assert_eq!(diff.gap_above(second), 13..25);
+
+        assert_eq!(diff.expand_above(second, &old_file(), 5), 6);
+        assert_eq!(headers(&diff)[1], "@@ -20,7 +19,7 @@ fn second()");
+        assert_eq!(
+            lines(&diff)[3..5],
+            [
+                (LineKind::Context { old: 20, new: 19 }, "line 20"),
+                (LineKind::Context { old: 21, new: 20 }, "line 21"),
+            ]
+        );
+
+        assert_eq!(diff.expand_above(second, &old_file(), 20), 7);
+        assert_eq!(headers(&diff), ["@@ -10,17 +10,16 @@ fn first()"]);
+        assert_eq!(
+            lines(&diff)[3],
+            (LineKind::Context { old: 13, new: 12 }, "line 13")
+        );
+    }
+
+    #[test]
+    fn expanding_the_first_hunk_to_the_top_drops_its_header() {
+        let mut diff = Diff::parse(GAPPY);
+        assert_eq!(diff.gap_above(1), 1..10);
+        assert_eq!(diff.expand_above(1, &old_file(), u32::MAX), 9);
+        assert_eq!(headers(&diff), ["@@ -25,2 +24,2 @@ fn second()"]);
+        assert_eq!(
+            lines(&diff)[0],
+            (LineKind::Context { old: 1, new: 1 }, "line 1")
+        );
+    }
+
+    #[test]
+    fn expanding_shifts_later_files() {
+        let mut diff = Diff::parse(&format!("{GAPPY}diff --git a/b b/b\n"));
+        let before = diff.files[1].first_row;
+        diff.expand_above(1, &old_file(), 3);
+        assert_eq!(diff.files[1].first_row, before + 3);
+        assert_eq!(diff.rows[diff.files[1].first_row], Row::File(1));
     }
 
     #[test]

@@ -13,8 +13,8 @@ use crate::theme::{MONO_FONT, Theme};
 #[cfg(target_os = "macos")]
 use crate::voice::{self, VoiceCommand};
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity,
-    FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, DispatchPhase,
+    Entity, FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
     ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, StyledText,
     Subscription, Task, TextLayout, TouchPhase, Window, actions, canvas, combine_highlights,
@@ -72,6 +72,8 @@ const SIDEBAR_WIDTH: f32 = 280.;
 const MIN_SIDEBAR_WIDTH: f32 = 160.;
 const MIN_MAIN_WIDTH: f32 = 320.;
 const SIDEBAR_HANDLE_WIDTH: f32 = 6.;
+/// Hidden lines revealed per click on a hunk header.
+const EXPAND_STEP: u32 = 20;
 
 /// A scrollable part of the window that draws its own scrollbar.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1486,6 +1488,23 @@ impl DiffView {
         cx.notify();
     }
 
+    /// Reveals the lines hidden above a hunk, a step at a time or all at once.
+    fn expand_hunk(&mut self, row: usize, old_blob: &str, all: bool, cx: &mut Context<Self>) {
+        let old_lines = match self.repo.blob_lines(old_blob) {
+            Ok(lines) => lines,
+            Err(err) => return self.show_status(format!("Couldn't read the file: {err}"), cx),
+        };
+        let header = self.display.item_of(row);
+        let limit = if all { u32::MAX } else { EXPAND_STEP };
+        let replacement = self.review.expand_hunk(row, &old_lines, limit);
+        if let Some(draft) = self.draft.as_mut().filter(|draft| draft.row > row) {
+            draft.row = draft.row + replacement - 1;
+        }
+        self.rebuild_display();
+        self.list.splice(header..header + 1, replacement);
+        cx.notify();
+    }
+
     fn toggle_collapsed(&mut self, file: usize, window: &mut Window, cx: &mut Context<Self>) {
         let collapsed = !self.review.collapsed.contains(&file);
         self.set_collapsed(file, collapsed, window, cx);
@@ -2580,15 +2599,30 @@ impl DiffView {
                 .pt(px(FILE_GAP))
                 .child(self.render_file_header(*file, &theme, cx))
                 .into_any_element(),
-            Row::Hunk { header, .. } => row
-                .px_3()
-                .py_0p5()
-                .bg(theme.hunk_bg)
-                .text_color(theme.muted)
-                .font_family(MONO_FONT)
-                .text_xs()
-                .child(self.highlighted_text(ix, header.clone(), None, Vec::new(), &theme))
-                .into_any_element(),
+            Row::Hunk(hunk) => {
+                let expandable_blob = self.review.diff.files[hunk.file]
+                    .old_blob
+                    .clone()
+                    .filter(|_| !self.review.diff.gap_above(ix).is_empty());
+                let hover = theme.hunk_bg.blend(theme.hover);
+                row.id(("hunk", ix))
+                    .px_3()
+                    .py_0p5()
+                    .bg(theme.hunk_bg)
+                    .text_color(theme.muted)
+                    .font_family(MONO_FONT)
+                    .text_xs()
+                    .child(self.highlighted_text(ix, hunk.header(), None, Vec::new(), &theme))
+                    .when_some(expandable_blob, |row, blob| {
+                        row.debug_selector(move || format!("hunk-{ix}"))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                this.expand_hunk(ix, &blob, event.modifiers().shift, cx)
+                            }))
+                    })
+                    .into_any_element()
+            }
             Row::Line { line, .. } => row
                 .child(self.render_inline_line(ix, line, &theme, cx))
                 .into_any_element(),
@@ -3547,6 +3581,52 @@ mod tests {
             cx.add_window_view(|window, cx| DiffView::new(review, repo, Vec::new(), window, cx));
         cx.run_until_parked();
         (view, cx)
+    }
+
+    #[gpui::test]
+    fn clicking_a_hunk_header_reveals_the_lines_above_it(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("diffront-expand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        let old: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.join("a"), &old).unwrap();
+        let blob = git(&["hash-object", "-w", "a"]);
+        let patch = format!(
+            "diff --git a/a b/a\nindex {}..1234567 100644\n--- a/a\n+++ b/a\n\
+             @@ -25,2 +25,2 @@\n-line 25\n+changed\n\x20line 26\n",
+            blob.trim()
+        );
+        cx.update(DiffView::bind_keys);
+        let review = Review::new("git diff HEAD".to_string(), Diff::parse(&patch));
+        let repo = Repo::at(&dir);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| DiffView::new(review, repo, Vec::new(), window, cx));
+        cx.run_until_parked();
+        let commented = 3;
+        view.update(cx, |view, _| view.review.set_comment(commented, "keep me"));
+
+        click_selector("hunk-1", cx);
+        cx.run_until_parked();
+        let (header, first_shown, comments) = view.read_with(cx, |view, _| {
+            (
+                view.review.diff.row_text(1).into_owned(),
+                view.review.diff.row_text(2).into_owned(),
+                view.review.comments.keys().copied().collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(header, "@@ -5,22 +5,22 @@");
+        assert_eq!(first_shown, "line 5");
+        assert_eq!(comments, [commented + EXPAND_STEP as usize]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn click_row(view: &Entity<DiffView>, row: usize, cx: &mut VisualTestContext) {

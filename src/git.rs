@@ -261,12 +261,23 @@ impl Repo {
                 "--first-parent",
                 "--no-color",
                 "--no-ext-diff",
+                "--full-index",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
                 sha,
             ]),
             &[0],
         )
+    }
+
+    pub fn blob_lines(&self, blob: &str) -> Result<Vec<String>, String> {
+        let content = Self::run(
+            Command::new("git")
+                .current_dir(&self.root)
+                .args(["cat-file", "blob", blob]),
+            &[0],
+        )?;
+        Ok(content.lines().map(str::to_string).collect())
     }
 
     /// Common review bases, with the default branch first.
@@ -424,6 +435,7 @@ impl Repo {
             "--patch",
             "--no-color",
             "--no-ext-diff",
+            "--full-index",
             "--src-prefix=a/",
             "--dst-prefix=b/",
         ]);
