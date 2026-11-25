@@ -513,10 +513,33 @@ impl Repo {
         command
     }
 
+    /// Pushes the current branch to origin and opens a new pull request for it in the browser.
+    pub fn open_pull_request(&self) -> Result<(), String> {
+        Self::run(
+            Command::new("git").current_dir(&self.root).args([
+                "push",
+                "--set-upstream",
+                "origin",
+                "HEAD",
+            ]),
+            &[0],
+        )?;
+        Self::run(
+            Command::new("gh")
+                .current_dir(&self.root)
+                .args(["pr", "create", "--web"]),
+            &[0],
+        )?;
+        Ok(())
+    }
+
     fn run(command: &mut Command, ok_codes: &[i32]) -> Result<String, String> {
-        let output = command
-            .output()
-            .map_err(|err| format!("failed to run git: {err}"))?;
+        let output = command.output().map_err(|err| {
+            format!(
+                "failed to run {}: {err}",
+                command.get_program().to_string_lossy()
+            )
+        })?;
         if output
             .status
             .code()

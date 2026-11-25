@@ -46,7 +46,6 @@ actions!(
     ]
 );
 
-const COPIED_NOTICE: Duration = Duration::from_secs(2);
 const STATUS_NOTICE: Duration = Duration::from_secs(5);
 const LINE_NUMBER_WIDTH: f32 = 44.;
 const INLINE_COMMENT_INDENT: f32 = 118.;
@@ -199,7 +198,7 @@ pub struct DiffView {
     pending_update: Option<PendingUpdate>,
     loading: Option<Task<()>>,
     status: Option<(SharedString, Task<()>)>,
-    copied_notice: Option<Task<()>>,
+    pull_request: Option<Task<()>>,
 }
 
 impl DiffView {
@@ -265,7 +264,7 @@ impl DiffView {
             pending_update: None,
             loading: None,
             status: None,
-            copied_notice: None,
+            pull_request: None,
         };
         view.reload_commits(window, cx);
         view
@@ -717,14 +716,29 @@ impl DiffView {
         let reviews: Vec<&Review> = reviews.into_iter().map(|(_, review)| review).collect();
         let export = Review::export_all(&self.overall, &reviews);
         cx.write_to_clipboard(ClipboardItem::new_string(export));
-        self.copied_notice = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(COPIED_NOTICE).await;
+        self.show_status("Copied to clipboard".to_string(), cx);
+    }
+
+    fn open_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pull_request.is_some() {
+            return;
+        }
+        self.close_finish_panel(window, cx);
+        let repo = self.repo.clone();
+        let opened = cx.background_spawn(async move { repo.open_pull_request() });
+        self.pull_request = Some(cx.spawn(async move |this, cx| {
+            let opened = opened.await;
             this.update(cx, |this, cx| {
-                this.copied_notice = None;
-                cx.notify();
+                this.pull_request = None;
+                let status = match opened {
+                    Ok(()) => "Opened the pull request in your browser".to_string(),
+                    Err(err) => format!("Couldn't open a pull request: {err}"),
+                };
+                this.show_status(status, cx);
             })
             .ok();
         }));
+        self.show_status("Pushing to origin…".to_string(), cx);
     }
 
     fn review_for(&self, key: &ViewKey) -> Option<&Review> {
@@ -1766,23 +1780,6 @@ impl DiffView {
         let files = &self.review.diff.files;
         let added: usize = files.iter().map(|file| file.added).sum();
         let removed: usize = files.iter().map(|file| file.removed).sum();
-        let count = self.comment_count();
-        let shortcut = if cfg!(target_os = "macos") {
-            "⌘⇧C"
-        } else {
-            "Ctrl+Shift+C"
-        };
-        let copy_label = if self.copied_notice.is_some() {
-            "Copied to clipboard".to_string()
-        } else if !self.overall.is_empty() {
-            format!("Copy review  {shortcut}")
-        } else {
-            format!(
-                "Copy {count} comment{}  {shortcut}",
-                if count == 1 { "" } else { "s" }
-            )
-        };
-        let can_copy = self.has_anything_to_copy();
         let status = self.status.as_ref().map(|(status, _)| status.clone());
         let tabs = div()
             .flex()
@@ -1871,39 +1868,6 @@ impl DiffView {
                     .on_click(
                         cx.listener(|this, _, window, cx| this.toggle_finish_panel(window, cx)),
                     ),
-            )
-            .child(
-                div()
-                    .id("copy-comments")
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap_1()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .text_xs()
-                    .when(!can_copy, |button| {
-                        button.bg(theme.hover).text_color(theme.muted)
-                    })
-                    .when(can_copy, |button| {
-                        button
-                            .bg(theme.accent)
-                            .text_color(theme.on_accent)
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.copy_comments(&CopyComments, window, cx)
-                            }))
-                    })
-                    .children(self.icon(
-                        Symbol::Copy,
-                        if can_copy {
-                            theme.on_accent
-                        } else {
-                            theme.muted
-                        },
-                    ))
-                    .child(copy_label),
             )
     }
 
@@ -3179,6 +3143,13 @@ impl DiffView {
                                     .debug_selector(|| "copy-review".to_string())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.copy_comments(&CopyComments, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Self::button("github-pr", "GitHub PR", theme)
+                                    .debug_selector(|| "github-pr".to_string())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_pull_request(window, cx)
                                     })),
                             )
                             .child(div().text_xs().text_color(theme.muted).child(hint)),
